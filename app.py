@@ -9,15 +9,26 @@ HEADERS = {"User-Agent": "PE-Website aihuaxiawenhua@gmail.com"}
 
 st.set_page_config(page_title="美股估值看板", layout="wide")
 
-# 压缩页面顶部留白，让四宫格一屏展示更紧凑
+# 修复顶部遮挡 + 压缩卡片内部间距，确保四宫格完整装进一屏不溢出
 st.markdown("""
     <style>
     .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 1rem;
+        padding-top: 3.2rem !important;
+        padding-bottom: 0.5rem !important;
+        padding-left: 2rem !important;
+        padding-right: 2rem !important;
+        max-width: 100% !important;
     }
+    /* 缩小指标数字和标题，节省垂直空间 */
+    [data-testid="stMetricValue"] {
+        font-size: 1.35rem !important;
+    }
+    [data-testid="stMetricLabel"] {
+        font-size: 0.8rem !important;
+    }
+    /* 右上/左下/右下的占位框高度与左上角卡片对齐 */
     .placeholder-box {
-        height: 360px;
+        height: 255px;
         display: flex;
         flex-direction: column;
         align-items: center;
@@ -31,10 +42,10 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# 顶部紧凑导航与全局搜索栏
-head_col1, head_col2, head_col3 = st.columns([2, 1, 1])
+# 顶部导航与全局搜索栏（垂直居中对齐）
+head_col1, head_col2, head_col3 = st.columns([2.5, 1, 1], vertical_alignment="center")
 with head_col1:
-    st.subheader("📊 美股核心数据看板")
+    st.markdown("### 📊 美股核心数据看板")
 with head_col2:
     ticker = st.text_input(
         "股票代码", "AAPL",
@@ -235,8 +246,10 @@ def load_pe(symbol, years):
 
 
 # ==================== 2x2 四宫格主体布局 ====================
-row1_left, row1_right = st.columns(2, gap="medium")
-row2_left, row2_right = st.columns(2, gap="medium")
+row1_left, row1_right = st.columns(2, gap="small")
+row2_left, row2_right = st.columns(2, gap="small")
+
+qdf_detail = None
 
 # 【左上角】：历史市盈率走势模块
 with row1_left:
@@ -244,7 +257,7 @@ with row1_left:
         st.markdown(f"**📈 {ticker} 历史市盈率 (PE-TTM)**")
         if ticker:
             with st.spinner("加载数据中..."):
-                df, qdf = load_pe(ticker, years)
+                df, qdf_detail = load_pe(ticker, years)
 
             if df is None or df["pe"].dropna().empty:
                 st.error("未找到有效正向 PE 数据，请检查股票代码或邮箱配置。")
@@ -272,28 +285,13 @@ with row1_left:
                 ))
                 fig.add_hline(y=median, line_dash="dash", annotation_text=f"中位 {median:.1f}")
                 fig.update_layout(
-                    height=260,
-                    margin=dict(l=10, r=10, t=10, b=10),
+                    height=195,
+                    margin=dict(l=5, r=5, t=8, b=5),
                     yaxis_title="PE",
                     xaxis_title=None,
                     hovermode="x unified",
                 )
-                st.plotly_chart(fig, use_container_width=True)
-
-                with st.expander("查看单季 EPS 明细"):
-                    show_q = qdf.sort_values("end", ascending=False).copy()
-                    show_q["end"] = show_q["end"].dt.strftime("%Y-%m-%d")
-                    show_q["filed"] = show_q["filed"].dt.strftime("%Y-%m-%d")
-                    show_q["val"] = show_q["val"].round(4)
-                    st.dataframe(
-                        show_q[["end", "filed", "val"]].rename(columns={
-                            "end": "财报期末",
-                            "filed": "首次披露日",
-                            "val": "单季EPS($)",
-                        }),
-                        height=180,
-                        use_container_width=True,
-                    )
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 # 【右上角】：预留功能位 1
 with row1_right:
@@ -327,5 +325,22 @@ with row2_right:
                 <div style="font-size: 0.85rem; margin-top: 6px;">例如：同行业多股票对比 / 自由现金流走势</div>
             </div>
         """, unsafe_allow_html=True)
+
+# 底部折叠明细与说明（不占用主屏幕四宫格高度）
+if qdf_detail is not None:
+    with st.expander("🔍 展开核对底层单季 EPS 明细"):
+        show_q = qdf_detail.sort_values("end", ascending=False).copy()
+        show_q["end"] = show_q["end"].dt.strftime("%Y-%m-%d")
+        show_q["filed"] = show_q["filed"].dt.strftime("%Y-%m-%d")
+        show_q["val"] = show_q["val"].round(4)
+        st.dataframe(
+            show_q[["end", "filed", "val"]].rename(columns={
+                "end": "财报期末",
+                "filed": "首次披露日",
+                "val": "拆股调整后单季EPS($)",
+            }),
+            height=200,
+            use_container_width=True,
+        )
 
 st.caption("数据来源：Yahoo Finance（股价）、SEC EDGAR（财务数据），仅供参考，不构成投资建议。")
