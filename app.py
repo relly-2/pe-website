@@ -7,11 +7,46 @@ import requests
 # 请把邮箱改成你自己的（SEC 要求）
 HEADERS = {"User-Agent": "PE-Website aihuaxiawenhua@gmail.com"}
 
-st.set_page_config(page_title="美股历史市盈率", layout="wide")
-st.title("📈 美股历史市盈率走势")
+st.set_page_config(page_title="美股估值看板", layout="wide")
 
-ticker = st.text_input("输入股票代码（如 AAPL、MSFT、NVDA）", "AAPL").upper().strip()
-years = st.selectbox("时间范围（年）", [1, 3, 5, 10], index=3)
+# 压缩页面顶部留白，让四宫格一屏展示更紧凑
+st.markdown("""
+    <style>
+    .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 1rem;
+    }
+    .placeholder-box {
+        height: 360px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        color: #888888;
+        background-color: rgba(128, 128, 128, 0.04);
+        border: 1px dashed rgba(128, 128, 128, 0.3);
+        border-radius: 8px;
+        text-align: center;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# 顶部紧凑导航与全局搜索栏
+head_col1, head_col2, head_col3 = st.columns([2, 1, 1])
+with head_col1:
+    st.subheader("📊 美股核心数据看板")
+with head_col2:
+    ticker = st.text_input(
+        "股票代码", "AAPL",
+        placeholder="输入代码如 AAPL、MSFT",
+        label_visibility="collapsed"
+    ).upper().strip()
+with head_col3:
+    years = st.selectbox(
+        "时间范围", [1, 3, 5, 10], index=3,
+        format_func=lambda x: f"过去 {x} 年",
+        label_visibility="collapsed"
+    )
 
 
 def to_ns(s):
@@ -46,12 +81,6 @@ def get_sec_facts(symbol):
 
 
 def build_ttm_eps(facts, splits_series):
-    """
-    从 SEC 数据提取单季 EPS 并合成 TTM EPS：
-    1. 取最新披露口径（SEC 历史对比列通常已按后续拆股重述）
-    2. 对未被后续财报重述的早期数据，按财报披露日(filed)补做拆股调整
-    3. 支持用 6个月/9个月/全年累计值 减去前期累计值，精准推算单季 EPS
-    """
     rows = None
     for concept in ["EarningsPerShareDiluted", "EarningsPerShareBasic"]:
         if concept in facts and "USD/shares" in facts[concept]["units"]:
@@ -72,14 +101,12 @@ def build_ttm_eps(facts, splits_series):
     df["val"] = df["val"].astype(float)
     df["dur"] = (df["end"] - df["start"]).dt.days
 
-    # 每段期间：记录【最早披露日】和【最新报告值】
     first_filed = df.groupby(["start", "end"])["filed"].min().rename("first_filed")
     latest = (df.sort_values("filed")
                 .groupby(["start", "end"], as_index=False)
                 .last()
                 .merge(first_filed, on=["start", "end"]))
 
-    # 按【最新那份财报的披露日】做拆股修正
     def adj_split(row):
         f = 1.0
         for sd, ratio in splits_series.items():
@@ -89,7 +116,6 @@ def build_ttm_eps(facts, splits_series):
 
     latest["val_adj"] = latest.apply(adj_split, axis=1)
 
-    # 1) 直接的单季数据（约 65 ~ 115 天）
     q_direct = latest[latest["dur"].between(65, 115)].copy()
     q_map = {}
     for _, r in q_direct.iterrows():
@@ -100,7 +126,6 @@ def build_ttm_eps(facts, splits_series):
             "filed": r["first_filed"],
         }
 
-    # 2) 用累计数据（半年、三季、全年）推算缺失的单季（尤其是 Q4）
     cum_df = latest[latest["dur"].between(165, 385)].sort_values("dur")
     for _, yr in cum_df.iterrows():
         if yr["end"] in q_map:
@@ -127,7 +152,6 @@ def build_ttm_eps(facts, splits_series):
 
     qdf = pd.DataFrame(list(q_map.values())).sort_values("end").reset_index(drop=True)
 
-    # 合并距离极近的重复期末
     cleaned = []
     for _, r in qdf.iterrows():
         if cleaned and (r["end"] - cleaned[-1]["end"]).days < 20:
@@ -139,7 +163,6 @@ def build_ttm_eps(facts, splits_series):
     qdf["end"] = to_ns(qdf["end"])
     qdf["filed"] = to_ns(qdf["filed"])
 
-    # 连续 4 个季度滚动求和得到 TTM EPS
     ttm_rows = []
     for i in range(3, len(qdf)):
         w = qdf.iloc[i - 3:i + 1]
@@ -184,7 +207,6 @@ def load_pe(symbol, years):
     df["date"] = to_ns(d)
     df["close"] = df["close"].astype(float)
 
-    # 获取拆股历史
     sp = pd.Series(dtype=float)
     try:
         s = t.splits
@@ -212,60 +234,98 @@ def load_pe(symbol, years):
     return df, qdf
 
 
-if ticker:
-    with st.spinner("正在获取并计算 10 年数据..."):
-        df, qdf = load_pe(ticker, years)
+# ==================== 2x2 四宫格主体布局 ====================
+row1_left, row1_right = st.columns(2, gap="medium")
+row2_left, row2_right = st.columns(2, gap="medium")
 
-    if df is None or df["pe"].dropna().empty:
-        st.error("没有找到该股票的数据，或该股票没有足够的正 EPS 记录。请检查代码，或确认邮箱已修改。")
-    else:
-        valid = df.dropna(subset=["pe"])
-        median = valid["pe"].median()
-        last_valid = valid.iloc[-1]
-        current_pe = last_valid["pe"]
-        percentile = (valid["pe"] < current_pe).mean() * 100
+# 【左上角】：历史市盈率走势模块
+with row1_left:
+    with st.container(border=True):
+        st.markdown(f"**📈 {ticker} 历史市盈率 (PE-TTM)**")
+        if ticker:
+            with st.spinner("加载数据中..."):
+                df, qdf = load_pe(ticker, years)
 
-        col1, col2, col3 = st.columns(3)
-        if pd.isna(df["pe"].iloc[-1]):
-            col1.metric("当前 PE", "亏损 (N/A)")
-        else:
-            col1.metric("当前 PE", f"{current_pe:.1f}")
-        col2.metric("历史中位数", f"{median:.1f}")
-        col3.metric("当前 PE 历史分位", f"{percentile:.0f}%")
+            if df is None or df["pe"].dropna().empty:
+                st.error("未找到有效正向 PE 数据，请检查股票代码或邮箱配置。")
+            else:
+                valid = df.dropna(subset=["pe"])
+                median = valid["pe"].median()
+                current_pe = valid["pe"].iloc[-1]
+                percentile = (valid["pe"] < current_pe).mean() * 100
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=df["date"],
-            y=df["pe"],
-            mode="lines",
-            name="PE (TTM)",
-            connectgaps=False,
-        ))
-        fig.add_hline(y=median, line_dash="dash", annotation_text=f"中位数 {median:.1f}")
-        fig.update_layout(
-            height=500,
-            yaxis_title="市盈率 (PE)",
-            xaxis_title="日期",
-            hovermode="x unified",
-        )
-        st.plotly_chart(fig, use_container_width=True)
+                m1, m2, m3 = st.columns(3)
+                if pd.isna(df["pe"].iloc[-1]):
+                    m1.metric("当前 PE", "亏损 (N/A)")
+                else:
+                    m1.metric("当前 PE", f"{current_pe:.1f}")
+                m2.metric("历史中位数", f"{median:.1f}")
+                m3.metric("历史分位", f"{percentile:.0f}%")
 
-        loss_days = df["ttm"].notna() & (df["ttm"] <= 0)
-        if loss_days.any():
-            st.info("💡 图表中空白断开的区间代表该公司当时处于亏损状态（TTM 每股收益 ≤ 0），市盈率无意义。")
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=df["date"],
+                    y=df["pe"],
+                    mode="lines",
+                    name="PE",
+                    connectgaps=False,
+                ))
+                fig.add_hline(y=median, line_dash="dash", annotation_text=f"中位 {median:.1f}")
+                fig.update_layout(
+                    height=260,
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    yaxis_title="PE",
+                    xaxis_title=None,
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
-        with st.expander("🔍 查看底层单季 EPS 明细（用于核对数据）"):
-            show_q = qdf.sort_values("end", ascending=False).copy()
-            show_q["end"] = show_q["end"].dt.strftime("%Y-%m-%d")
-            show_q["filed"] = show_q["filed"].dt.strftime("%Y-%m-%d")
-            show_q["val"] = show_q["val"].round(4)
-            st.dataframe(
-                show_q[["end", "filed", "val"]].rename(columns={
-                    "end": "财报期末",
-                    "filed": "首次披露日",
-                    "val": "拆股调整后单季EPS($)",
-                }),
-                use_container_width=True,
-            )
+                with st.expander("查看单季 EPS 明细"):
+                    show_q = qdf.sort_values("end", ascending=False).copy()
+                    show_q["end"] = show_q["end"].dt.strftime("%Y-%m-%d")
+                    show_q["filed"] = show_q["filed"].dt.strftime("%Y-%m-%d")
+                    show_q["val"] = show_q["val"].round(4)
+                    st.dataframe(
+                        show_q[["end", "filed", "val"]].rename(columns={
+                            "end": "财报期末",
+                            "filed": "首次披露日",
+                            "val": "单季EPS($)",
+                        }),
+                        height=180,
+                        use_container_width=True,
+                    )
 
-        st.caption("数据来源：Yahoo Finance（股价）、SEC EDGAR（EPS），仅供参考，不构成投资建议。")
+# 【右上角】：预留功能位 1
+with row1_right:
+    with st.container(border=True):
+        st.markdown("**🧩 预留模块 1（右上）**")
+        st.markdown("""
+            <div class="placeholder-box">
+                <div>🚧 功能预留位</div>
+                <div style="font-size: 0.85rem; margin-top: 6px;">例如：历史股价走势 / 市销率(PS) / 市净率(PB)</div>
+            </div>
+        """, unsafe_allow_html=True)
+
+# 【左下角】：预留功能位 2
+with row2_left:
+    with st.container(border=True):
+        st.markdown("**🧩 预留模块 2（左下）**")
+        st.markdown("""
+            <div class="placeholder-box">
+                <div>🚧 功能预留位</div>
+                <div style="font-size: 0.85rem; margin-top: 6px;">例如：季度营收与净利润柱状图</div>
+            </div>
+        """, unsafe_allow_html=True)
+
+# 【右下角】：预留功能位 3
+with row2_right:
+    with st.container(border=True):
+        st.markdown("**🧩 预留模块 3（右下）**")
+        st.markdown("""
+            <div class="placeholder-box">
+                <div>🚧 功能预留位</div>
+                <div style="font-size: 0.85rem; margin-top: 6px;">例如：同行业多股票对比 / 自由现金流走势</div>
+            </div>
+        """, unsafe_allow_html=True)
+
+st.caption("数据来源：Yahoo Finance（股价）、SEC EDGAR（财务数据），仅供参考，不构成投资建议。")
