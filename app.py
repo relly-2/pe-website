@@ -3,10 +3,10 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 import requests
+from curl_cffi import requests as cffi_requests
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 import html
-import re
 
 # 请把邮箱改成你自己的（SEC 要求）
 HEADERS = {"User-Agent": "PE-Website aihuaxiawenhua@gmail.com"}
@@ -53,28 +53,22 @@ st.markdown("""
         padding-right: 6px;
     }
     .sa-item {
-        padding: 9px 4px;
+        padding: 8px 4px;
         border-bottom: 1px solid rgba(128, 128, 128, 0.16);
-        display: flex;
-        align-items: flex-start;
-        justify-content: space-between;
-        gap: 10px;
     }
     .sa-item:last-child {
         border-bottom: none;
     }
-    .sa-item-main {
-        flex: 1;
-        min-width: 0;
+    .sa-title-line {
+        line-height: 1.45;
     }
-    .sa-item-main a {
+    .sa-title-line a {
         text-decoration: none;
         font-size: 0.88rem;
         font-weight: 600;
-        line-height: 1.4;
-        display: block;
+        vertical-align: middle;
     }
-    .sa-item-main a:hover {
+    .sa-title-line a:hover {
         text-decoration: underline;
     }
     .sa-meta {
@@ -82,19 +76,18 @@ st.markdown("""
         color: #888888;
         margin-top: 4px;
     }
-    /* 复刻 Seeking Alpha 官网经典评级胶囊样式 */
+    /* 复刻 Seeking Alpha 官网经典评级色块（移至标题前方） */
     .sa-rating {
-        flex-shrink: 0;
         display: inline-block;
-        padding: 2px 8px;
-        border-radius: 4px;
+        padding: 1px 7px;
+        border-radius: 3px;
         font-size: 0.72rem;
         font-weight: 700;
-        line-height: 1.4;
+        line-height: 1.45;
         text-align: center;
-        min-width: 58px;
-        margin-top: 1px;
-        letter-spacing: 0.3px;
+        margin-right: 7px;
+        vertical-align: middle;
+        letter-spacing: 0.2px;
     }
     .sa-strong-buy {
         background-color: #12733b;
@@ -157,7 +150,7 @@ def format_pub_date(raw_date):
             return str(raw_date)[:16]
 
 
-# Seeking Alpha 官方评级映射表 -> (中文文案, CSS类名)
+# Seeking Alpha 官方原始评级字段精确映射 -> (中文文案, CSS类名)
 RATING_MAP = {
     "strong_buy": ("强烈买入", "sa-strong-buy"),
     "very_bullish": ("强烈买入", "sa-strong-buy"),
@@ -174,20 +167,22 @@ RATING_MAP = {
 }
 
 
-def infer_rating_from_title(title_en):
-    """当备用 RSS 通道未携带结构化评级字段时，根据分析标题语义精准推断评级"""
-    t = title_en.lower()
-    if re.search(r"\bstrong\s+buy\b|\bscreaming\s+buy\b|\btable[- ]pounding\s+buy\b|\bgenerational\s+buy\b", t):
-        return "strong_buy"
-    if re.search(r"\bstrong\s+sell\b", t):
-        return "strong_sell"
-    if re.search(r"\bdowngrad\w*\s+to\s+sell\b|\brating\s+cut\s+to\s+sell\b|\bsell\s+now\b|\btime\s+to\s+sell\b|\bavoid\b|\bovervalued\b|\bbubble\b|\bbearish\b", t):
-        return "sell"
-    if re.search(r"\bdowngrad\w*\s+to\s+hold\b|\bhold\s+for\s+now\b|\bwait\s+for\s+a?\s*pullback\b|\bfairly\s+valued\b|\bpriced\s+in\b|\bsidelines\b|\bcautious\b|\bhold\b", t):
-        return "hold"
-    if re.search(r"\bupgrad\w*\s+to\s+buy\b|\bbuy\s+the\s+dip\b|\bundervalued\b|\bbullish\b|\bworth\s+buying\b|\bstill\s+a\s+buy\b|\breiterat\w+\s+buy\b|\bbuy\b", t):
-        return "buy"
-    return "hold"
+def normalize_sa_sentiment(attrs):
+    """
+    精确解析 Seeking Alpha v3 API 中 sentiment 对象的真实评级：
+    SA v3 的 sentiment.attributes 中：
+    - type 字段为字符串：'very_bullish' | 'bullish' | 'neutral' | 'bearish' | 'very_bearish'
+      或 'strong_buy' | 'buy' | 'hold' | 'sell' | 'strong_sell'
+    """
+    if not attrs:
+        return None
+    for field in ["type", "rating", "label", "slug"]:
+        val = attrs.get(field)
+        if isinstance(val, str):
+            k = val.strip().lower().replace("-", "_")
+            if k in RATING_MAP:
+                return k
+    return None
 
 
 def translate_titles_to_zh(titles):
@@ -235,169 +230,197 @@ def translate_titles_to_zh(titles):
     return res
 
 
+def fetch_article_exact_rating(session, article_id, target_tag_id, symbol):
+    """当列表接口未展开某篇文章的 sentiments 时，单独查询单篇文章详情拿官网精确评级"""
+    url = f"https://seekingalpha.com/api/v3/articles/{article_id}?include=sentiments,sentiments.tag"
+    try:
+        r = session.get(url, timeout=8)
+        if r.status_code != 200:
+            return None
+        payload = r.json()
+        included = payload.get("included") or []
+        tags_by_id = {}
+        for item in included:
+            if item.get("type") == "tag":
+                slug = (item.get("attributes", {}).get("slug") or "").upper()
+                name = (item.get("attributes", {}).get("name") or "").upper()
+                tags_by_id[str(item.get("id"))] = (slug, name)
+
+        fallback_rk = None
+        for item in included:
+            if item.get("type") == "sentiment":
+                rk = normalize_sa_sentiment(item.get("attributes") or {})
+                if not rk:
+                    continue
+                rels = item.get("relationships") or {}
+                st_id = str((rels.get("tag", {}).get("data") or {}).get("id") or "")
+                if target_tag_id and st_id == target_tag_id:
+                    return rk
+                slug, name = tags_by_id.get(st_id, ("", ""))
+                if slug == symbol or name == symbol:
+                    return rk
+                if fallback_rk is None:
+                    fallback_rk = rk
+        return fallback_rk
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=1800)
 def load_seeking_alpha_feed(symbol):
     """
-    仅获取 Seeking Alpha 股票深度分析文章（剔除快讯），并读取分析师评级与作者信息：
-    通道 1：Seeking Alpha 官网 v3 Articles JSON API（含官方 sentiments 精确评级）
-    通道 2：Seeking Alpha 官方 XML 分析流（严格过滤仅保留 /article/ 分析文章）
-    通道 3：Google News 定向检索 seekingalpha.com/article 分析文章兜底
+    通过 curl_cffi 模拟真实 Chrome TLS 指纹请求 Seeking Alpha 官方 v3 分析接口，
+    显式携带 include=author,sentiments,sentiments.tag，确保拿到的作者评级与 SA 官网 100% 一致！
     """
-    json_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
+    sa_sym = symbol.lower().replace(".", "-")
+    headers = {
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": f"https://seekingalpha.com/symbol/{symbol.lower()}/analysis",
+        "Referer": f"https://seekingalpha.com/symbol/{sa_sym}/analysis",
+        "Origin": "https://seekingalpha.com",
     }
 
     articles = []
 
-    # 通道 1：Seeking Alpha v3 Articles API（纯分析文章 + 原生分析师评级）
-    v3_url = f"https://seekingalpha.com/api/v3/symbols/{symbol.lower()}/articles?page[size]=15"
     try:
-        r = requests.get(v3_url, headers=json_headers, timeout=10)
-        if r.status_code == 200:
-            payload = r.json()
-            data_list = payload.get("data") or []
-            included = payload.get("included") or []
+        with cffi_requests.Session(impersonate="chrome") as session:
+            session.headers.update(headers)
+            # 先访问一次分析页建立合法 Cookie 会话，大幅提高 v3 JSON API 通过率
+            v3_url = (
+                f"https://seekingalpha.com/api/v3/symbols/{sa_sym}/articles"
+                f"?filter[category]=latest-articles"
+                f"&include=author,sentiments,sentiments.tag,primaryTickers,secondaryTickers"
+                f"&page[size]=15"
+            )
+            r = session.get(v3_url, timeout=12)
+            if r.status_code != 200:
+                session.get(f"https://seekingalpha.com/symbol/{sa_sym}/analysis", timeout=10)
+                r = session.get(v3_url, timeout=12)
 
-            # 建立 included 字典（提取作者姓名、目标股票对应的官方评级类型）
-            inc_map = {(item.get("type"), str(item.get("id"))): item for item in included}
-            tag_id_for_sym = None
-            for item in included:
-                if item.get("type") == "tag":
-                    slug = (item.get("attributes", {}).get("slug") or "").upper()
-                    name = (item.get("attributes", {}).get("name") or "").upper()
-                    if slug == symbol or name == symbol:
-                        tag_id_for_sym = str(item.get("id"))
-                        break
+            if r.status_code == 200:
+                payload = r.json()
+                data_list = payload.get("data") or []
+                included = payload.get("included") or []
 
-            # 建立 sentiment_id -> rating_key 映射（如 strong_buy / buy / hold / sell / strong_sell）
-            sent_rating_map = {}
-            for item in included:
-                if item.get("type") == "sentiment":
-                    sid = str(item.get("id"))
+                inc_authors = {}
+                tag_id_for_sym = None
+                tags_by_id = {}
+
+                for item in included:
+                    itype = item.get("type")
+                    iid = str(item.get("id"))
                     attrs = item.get("attributes") or {}
-                    rels = item.get("relationships") or {}
-                    # 检查是否对应当前查询的股票代码（若存在多标的）
-                    sent_tag_id = str((rels.get("tag", {}).get("data") or {}).get("id") or "")
-                    r_type = str(attrs.get("type") or attrs.get("sentimentId") or "").lower()
-                    # 数字枚举兼容（SA 部分版本返回 1:strong_buy, 2:buy, 3:hold, 4:sell, 5:strong_sell）
-                    num_map = {"1": "strong_buy", "2": "buy", "3": "hold", "4": "sell", "5": "strong_sell"}
-                    r_key = num_map.get(r_type, r_type)
-                    if r_key in RATING_MAP:
-                        sent_rating_map[sid] = (r_key, sent_tag_id)
+                    if itype == "author":
+                        inc_authors[iid] = (attrs.get("nick") or "Seeking Alpha Analyst").strip()
+                    elif itype == "tag":
+                        slug = (attrs.get("slug") or "").upper()
+                        name = (attrs.get("name") or "").upper()
+                        tags_by_id[iid] = (slug, name)
+                        if slug in (symbol, sa_sym.upper()) or name in (symbol, sa_sym.upper()):
+                            tag_id_for_sym = iid
 
-            for art in data_list:
-                if art.get("type") != "article":
-                    continue
-                attrs = art.get("attributes") or {}
-                title = (attrs.get("title") or "").strip()
-                if not title:
-                    continue
-                pub = format_pub_date(attrs.get("publishOn") or "")
+                # 解析每个 sentiment 对应的真实评级与所属股票 tag_id
+                sent_map = {}
+                for item in included:
+                    if item.get("type") == "sentiment":
+                        sid = str(item.get("id"))
+                        rk = normalize_sa_sentiment(item.get("attributes") or {})
+                        rels = item.get("relationships") or {}
+                        st_id = str((rels.get("tag", {}).get("data") or {}).get("id") or "")
+                        if rk:
+                            sent_map[sid] = (rk, st_id)
 
-                # 解析作者名
-                rels = art.get("relationships") or {}
-                author_id = str((rels.get("author", {}).get("data") or {}).get("id") or "")
-                author_obj = inc_map.get(("author", author_id), {})
-                author_name = (author_obj.get("attributes", {}).get("nick") or "Seeking Alpha Analyst").strip()
+                for art in data_list:
+                    if art.get("type") != "article":
+                        continue
+                    art_id = str(art.get("id") or "")
+                    attrs = art.get("attributes") or {}
+                    title = (attrs.get("title") or "").strip()
+                    if not title:
+                        continue
+                    pub = format_pub_date(attrs.get("publishOn") or "")
 
-                # 解析该文章对当前股票的官方评级
-                rating_key = None
-                sent_list = (rels.get("sentiments", {}).get("data")) or []
-                if isinstance(sent_list, dict):
-                    sent_list = [sent_list]
-                for s_ref in sent_list:
-                    sid = str(s_ref.get("id") or "")
-                    if sid in sent_rating_map:
-                        rk, st_id = sent_rating_map[sid]
-                        if not tag_id_for_sym or not st_id or st_id == tag_id_for_sym:
-                            rating_key = rk
-                            break
+                    rels = art.get("relationships") or {}
+                    author_id = str((rels.get("author", {}).get("data") or {}).get("id") or "")
+                    author_name = inc_authors.get(author_id, "Seeking Alpha Analyst")
+
+                    # 精准匹配该作者对【当前查询股票】打出的评级（一篇文章点评多只股票时也不会串台）
+                    rating_key = None
+                    fallback_rk = None
+                    sent_refs = (rels.get("sentiments", {}).get("data"))
+                    if isinstance(sent_refs, dict):
+                        sent_refs = [sent_refs]
+
+                    if sent_refs:
+                        for s_ref in sent_refs:
+                            sid = str(s_ref.get("id") or "")
+                            if sid in sent_map:
+                                rk, st_id = sent_map[sid]
+                                slug, name = tags_by_id.get(st_id, ("", ""))
+                                if (tag_id_for_sym and st_id == tag_id_for_sym) or slug == symbol or name == symbol:
+                                    rating_key = rk
+                                    break
+                                if fallback_rk is None:
+                                    fallback_rk = rk
                         if rating_key is None:
-                            rating_key = rk
+                            rating_key = fallback_rk
+                    elif art_id:
+                        # 若列表未下发 sentiments 关系，单独补查该文章详情获取真实评级
+                        rating_key = fetch_article_exact_rating(session, art_id, tag_id_for_sym, symbol)
 
-                if not rating_key:
-                    rating_key = infer_rating_from_title(title)
-
-                articles.append({
-                    "title_en": title,
-                    "date": pub,
-                    "author": author_name,
-                    "rating_key": rating_key,
-                })
+                    articles.append({
+                        "title_en": title,
+                        "date": pub,
+                        "author": author_name,
+                        "rating_key": rating_key,  # 若官网本身无评级则为 None，绝不瞎编
+                    })
     except Exception:
         pass
 
-    # 通道 2：Seeking Alpha 官方 XML Feed（严格只取 /article/ 分析类，彻底丢弃快讯）
+    # 若偶发网络异常未拿到 v3 JSON，回退官方 XML 分析流（仅取 /article/ 分析文章，并逐篇补查真实评级）
     if not articles:
-        xml_headers = {
-            "User-Agent": json_headers["User-Agent"],
-            "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
-        }
-        sa_url = f"https://seekingalpha.com/api/sa/combined/{symbol}.xml"
+        sa_xml_url = f"https://seekingalpha.com/api/sa/combined/{symbol}.xml"
         try:
-            r = requests.get(sa_url, headers=xml_headers, timeout=12)
-            if r.status_code == 200 and r.content:
-                root = ET.fromstring(r.content)
-                ns = {"sa": "https://seekingalpha.com/api/1.0"}
-                for item in root.findall("./channel/item"):
-                    orig_link = (item.findtext("link") or "").strip()
-                    # 只保留分析文章（/article/），跳过一切快讯（/news/ 等）
-                    if "/article/" not in orig_link:
-                        continue
-                    title = (item.findtext("title") or "").strip()
-                    pub = format_pub_date(item.findtext("pubDate") or "")
-                    author = (item.findtext("sa:author_name", namespaces=ns) or "").strip()
-                    if title:
-                        articles.append({
-                            "title_en": title,
-                            "date": pub,
-                            "author": author or "Seeking Alpha Analyst",
-                            "rating_key": infer_rating_from_title(title),
-                        })
-                    if len(articles) >= 15:
-                        break
+            with cffi_requests.Session(impersonate="chrome") as session:
+                r = session.get(sa_xml_url, timeout=12)
+                if r.status_code == 200 and r.content:
+                    root = ET.fromstring(r.content)
+                    ns = {"sa": "https://seekingalpha.com/api/1.0"}
+                    for item in root.findall("./channel/item"):
+                        orig_link = (item.findtext("link") or "").strip()
+                        if "/article/" not in orig_link:
+                            continue
+                        title = (item.findtext("title") or "").strip()
+                        pub = format_pub_date(item.findtext("pubDate") or "")
+                        author = (item.findtext("sa:author_name", namespaces=ns) or "").strip()
+                        # 从链接提取 article_id，如 /article/4738291-xxx -> 4738291
+                        art_id = orig_link.split("/article/")[-1].split("-")[0].split("?")[0]
+                        rk = fetch_article_exact_rating(session, art_id, None, symbol) if art_id.isdigit() else None
+                        if title:
+                            articles.append({
+                                "title_en": title,
+                                "date": pub,
+                                "author": author or "Seeking Alpha Analyst",
+                                "rating_key": rk,
+                            })
+                        if len(articles) >= 15:
+                            break
         except Exception:
             pass
 
-    # 通道 3（终极防爬兜底）：Google News RSS 限定 site:seekingalpha.com/article（纯分析文章）
-    if not articles:
-        gn_url = (
-            f"https://news.google.com/rss/search?"
-            f"q=site:seekingalpha.com/article+{symbol}&hl=en-US&gl=US&ceid=US:en"
-        )
-        try:
-            r = requests.get(gn_url, headers={"User-Agent": json_headers["User-Agent"]}, timeout=12)
-            if r.status_code == 200 and r.content:
-                root = ET.fromstring(r.content)
-                for item in root.findall("./channel/item")[:15]:
-                    raw_title = (item.findtext("title") or "").strip()
-                    clean_title = raw_title.rsplit(" - Seeking Alpha", 1)[0].strip()
-                    pub = format_pub_date(item.findtext("pubDate") or "")
-                    if clean_title:
-                        articles.append({
-                            "title_en": clean_title,
-                            "date": pub,
-                            "author": "Seeking Alpha Analyst",
-                            "rating_key": infer_rating_from_title(clean_title),
-                        })
-        except Exception:
-            pass
-
-    # 批量翻译英文标题为简体中文，并挂载对应的评级样式
+    # 批量翻译英文标题为简体中文，并挂载官网真实评级样式
     if articles:
         zh_titles = translate_titles_to_zh([a["title_en"] for a in articles])
         for art, zh in zip(articles, zh_titles):
             art["title_zh"] = zh
-            label, css_cls = RATING_MAP.get(art["rating_key"], ("持有", "sa-hold"))
-            art["rating_label"] = label
-            art["rating_cls"] = css_cls
+            rk = art.get("rating_key")
+            if rk and rk in RATING_MAP:
+                label, css_cls = RATING_MAP[rk]
+                art["rating_label"] = label
+                art["rating_cls"] = css_cls
+            else:
+                art["rating_label"] = None
+                art["rating_cls"] = None
 
     return articles
 
@@ -675,143 +698,3 @@ row2_left, row2_right = st.columns(2, gap="small")
 detail_meta = None
 
 # 【左上角】：历史市盈率走势模块
-with row1_left:
-    with st.container(border=True):
-        if ticker:
-            with st.spinner(f"正在加载 {ticker} 估值数据..."):
-                df, detail_meta = load_any_pe(ticker, years)
-
-            is_etf = bool(detail_meta and detail_meta.get("is_etf"))
-            tag = "ETF 重仓拟合" if is_etf else "PE-TTM"
-            st.markdown(f"**📈 {ticker} 历史市盈率 ({tag})**")
-
-            if df is None or df["pe"].dropna().empty:
-                st.error("未找到有效 PE 数据，请检查代码（如 AAPL、SPY、QQQ）或确认邮箱已修改。")
-            else:
-                valid = df.dropna(subset=["pe"])
-                median = valid["pe"].median()
-                current_pe = valid["pe"].iloc[-1]
-                percentile = (valid["pe"] < current_pe).mean() * 100
-
-                m1, m2, m3 = st.columns(3)
-                if pd.isna(df["pe"].iloc[-1]):
-                    m1.metric("当前 PE", "亏损 (N/A)")
-                else:
-                    m1.metric("当前 PE", f"{current_pe:.1f}")
-                m2.metric("历史中位数", f"{median:.1f}")
-                m3.metric("历史分位", f"{percentile:.0f}%")
-
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=df["date"],
-                    y=df["pe"],
-                    mode="lines",
-                    name="PE",
-                    connectgaps=False,
-                ))
-                fig.add_hline(y=median, line_dash="dash", annotation_text=f"中位 {median:.1f}")
-                fig.update_layout(
-                    height=195,
-                    margin=dict(l=5, r=5, t=8, b=5),
-                    yaxis_title="PE",
-                    xaxis_title=None,
-                    hovermode="x unified",
-                )
-                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-# 【右上角】：Seeking Alpha 股票深度分析列表（纯分析 + SA 同款评级胶囊 + 中文标题 + 专属推广链接）
-with row1_right:
-    with st.container(border=True):
-        safe_ref_url = html.escape(SA_REFERRAL_URL, quote=True)
-        sa_head1, sa_head2 = st.columns([2.8, 1.2])
-        with sa_head1:
-            st.markdown(f"**📰 Seeking Alpha 最新分析 ({ticker})**")
-        with sa_head2:
-            st.markdown(
-                f"<div style='text-align:right; font-size:0.8rem;'>"
-                f"<a href='{safe_ref_url}' target='_blank' rel='noopener noreferrer' "
-                f"style='text-decoration:none; color:#e66a00; font-weight:600;'>订阅优惠解锁 ↗</a></div>",
-                unsafe_allow_html=True,
-            )
-
-        if ticker:
-            with st.spinner("正在拉取 Seeking Alpha 股票分析与评级..."):
-                sa_articles = load_seeking_alpha_feed(ticker)
-
-            if not sa_articles:
-                st.markdown(f"""
-                    <div class="placeholder-box">
-                        <div>📭 暂未获取到 {html.escape(ticker)} 的最新深度分析文章</div>
-                        <div style="font-size: 0.8rem; margin-top: 6px;">
-                            <a href="{safe_ref_url}" target="_blank" rel="noopener noreferrer">点击前往 Seeking Alpha 官网查看 ↗</a>
-                        </div>
-                    </div>
-                """, unsafe_allow_html=True)
-            else:
-                items_html = []
-                for art in sa_articles:
-                    safe_title_zh = html.escape(art.get("title_zh") or art["title_en"])
-                    safe_title_en = html.escape(art["title_en"], quote=True)
-                    safe_author = html.escape(art["author"])
-                    safe_date = html.escape(art["date"])
-                    r_label = html.escape(art["rating_label"])
-                    r_cls = html.escape(art["rating_cls"], quote=True)
-                    items_html.append(
-                        f'<div class="sa-item">'
-                        f'<div class="sa-item-main">'
-                        f'<a href="{safe_ref_url}" target="_blank" rel="noopener noreferrer" title="{safe_title_en}">{safe_title_zh}</a>'
-                        f'<div class="sa-meta">{safe_author} &nbsp;·&nbsp; {safe_date}</div>'
-                        f'</div>'
-                        f'<span class="sa-rating {r_cls}">{r_label}</span>'
-                        f'</div>'
-                    )
-                st.markdown(
-                    f'<div class="sa-scroll-box">{"".join(items_html)}</div>',
-                    unsafe_allow_html=True,
-                )
-
-# 【左下角】：预留功能位 2
-with row2_left:
-    with st.container(border=True):
-        st.markdown("**🧩 预留模块 2（左下）**")
-        st.markdown("""
-            <div class="placeholder-box">
-                <div>🚧 功能预留位</div>
-                <div style="font-size: 0.85rem; margin-top: 6px;">例如：季度营收与净利润柱状图</div>
-            </div>
-        """, unsafe_allow_html=True)
-
-# 【右下角】：预留功能位 3
-with row2_right:
-    with st.container(border=True):
-        st.markdown("**🧩 预留模块 3（右下）**")
-        st.markdown("""
-            <div class="placeholder-box">
-                <div>🚧 功能预留位</div>
-                <div style="font-size: 0.85rem; margin-top: 6px;">例如：同行业多股票对比 / 自由现金流走势</div>
-            </div>
-        """, unsafe_allow_html=True)
-
-# 底部折叠明细
-if detail_meta is not None:
-    if detail_meta.get("is_etf"):
-        with st.expander(f"🔍 说明：{ticker} 为 ETF 基金，点击查看参与拟合的前十大核心成分股"):
-            st.caption("注：ETF 无 SEC 10-Q/10-K 财报，曲线由核心重仓股历史加权盈利率(E/P)合成，并按基金最新整体 PE 校准。")
-            st.dataframe(detail_meta["holdings_df"], height=180, use_container_width=True)
-    elif detail_meta.get("qdf") is not None:
-        with st.expander("🔍 展开核对底层单季 EPS 明细"):
-            show_q = detail_meta["qdf"].sort_values("end", ascending=False).copy()
-            show_q["end"] = show_q["end"].dt.strftime("%Y-%m-%d")
-            show_q["filed"] = show_q["filed"].dt.strftime("%Y-%m-%d")
-            show_q["val"] = show_q["val"].round(4)
-            st.dataframe(
-                show_q[["end", "filed", "val"]].rename(columns={
-                    "end": "财报期末",
-                    "filed": "首次披露日",
-                    "val": "拆股调整后单季EPS($)",
-                }),
-                height=200,
-                use_container_width=True,
-            )
-
-st.caption("数据来源：Yahoo Finance、SEC EDGAR、Seeking Alpha，仅供参考，不构成投资建议。")
