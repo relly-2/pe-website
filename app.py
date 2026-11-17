@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 import requests
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
+import time
 import html
 
 # 请把邮箱改成你自己的（SEC 要求）
@@ -15,6 +16,9 @@ SA_REFERRAL_URL = (
     "https://seekingalpha.com/subscriptions/refer-a-friend"
     "?source=refer_friend_link&user_referrer=91b69c96c70651cc37407aca"
 )
+
+# 方案二：Apify 专门提取 Seeking Alpha 分析文章及作者评级的 Actor
+APIFY_ACTOR_ID = "fortuitous_pirate~seekingalpha-stock-analysis-scraper"
 
 st.set_page_config(page_title="美股估值看板", layout="wide")
 
@@ -169,24 +173,13 @@ RATING_MAP = {
     "very bearish": ("强烈卖出", "sa-strong-sell"),
 }
 
-# Seeking Alpha 数据库真实 sentimentId 对应表
-SA_SENTIMENT_ID_MAP = {
-    "1": "buy",
-    "2": "hold",
-    "3": "sell",
-    "4": "strong_buy",
-    "5": "strong_sell",
-}
-
 
 def normalize_rating_str(raw_rating):
     if raw_rating is None:
         return None
     s = str(raw_rating).strip().lower()
-    if not s:
+    if not s or s in ("none", "n/a", "null", "unknown"):
         return None
-    if s in SA_SENTIMENT_ID_MAP:
-        return SA_SENTIMENT_ID_MAP[s]
     k_space = s.replace("-", " ").replace("_", " ")
     k_under = k_space.replace(" ", "_")
     if k_space in RATING_MAP:
@@ -196,86 +189,43 @@ def normalize_rating_str(raw_rating):
     return None
 
 
-def parse_v3_json_payload(payload, symbol):
-    """解析 Seeking Alpha 官网原生 /api/v3/symbols/{ticker}/articles JSON 数据"""
-    out = []
-    if not isinstance(payload, dict):
-        return out
-    data_list = payload.get("data") or []
-    included = payload.get("included") or []
-    sa_sym_up = symbol.upper().replace(".", "-")
-
-    inc_authors = {}
-    tags_by_id = {}
-    target_tag_id = None
-
-    for item in included:
-        itype = item.get("type")
-        iid = str(item.get("id"))
-        attrs = item.get("attributes") or {}
-        if itype == "author":
-            inc_authors[iid] = (attrs.get("nick") or "Seeking Alpha Analyst").strip()
-        elif itype == "tag":
-            slug = (attrs.get("slug") or "").upper()
-            name = (attrs.get("name") or "").upper()
-            tags_by_id[iid] = (slug, name)
-            if slug in (symbol, sa_sym_up) or name in (symbol, sa_sym_up):
-                target_tag_id = iid
-
-    sent_map = {}
-    for item in included:
-        if item.get("type") == "sentiment":
-            sid = str(item.get("id"))
-            attrs = item.get("attributes") or {}
-            rk = None
-            for fld in ("type", "rating", "label", "slug", "sentimentId"):
-                rk = normalize_rating_str(attrs.get(fld))
-                if rk:
-                    break
-            rels = item.get("relationships") or {}
-            st_id = str((rels.get("tag", {}).get("data") or {}).get("id") or "")
-            if rk:
-                sent_map[sid] = (rk, st_id)
-
-    for art in data_list:
-        if art.get("type") != "article":
+def parse_apify_dataset_items(items, target_symbol):
+    """从 Apify 数据集条目中提取纯分析文章和作者评级"""
+    parsed = []
+    if not isinstance(items, list):
+        return parsed
+    for item in items:
+        if not isinstance(item, dict):
             continue
-        attrs = art.get("attributes") or {}
-        title = (attrs.get("title") or "").strip()
+        # 校验该数据集是否属于当前查询的股票代码
+        st_sym = str(item.get("search_ticker") or "").upper().strip()
+        if st_sym and st_sym != target_symbol:
+            continue
+
+        title = (item.get("article_title") or item.get("title") or "").strip()
         if not title:
             continue
-        pub = format_pub_date(attrs.get("publishOn") or "")
+        atype = str(item.get("analysis_type") or "analysis").strip().lower()
+        aurl = str(item.get("article_url") or item.get("url") or "")
+        if atype == "news" or ("/news/" in aurl and "/article/" not in aurl):
+            continue
 
-        rels = art.get("relationships") or {}
-        author_id = str((rels.get("author", {}).get("data") or {}).get("id") or "")
-        author_name = inc_authors.get(author_id, "Seeking Alpha Analyst")
-
-        rating_key = None
-        fallback_rk = None
-        sent_refs = (rels.get("sentiments", {}).get("data"))
-        if isinstance(sent_refs, dict):
-            sent_refs = [sent_refs]
-        if sent_refs:
-            for s_ref in sent_refs:
-                sid = str(s_ref.get("id") or "")
-                if sid in sent_map:
-                    rk, st_id = sent_map[sid]
-                    slug, name = tags_by_id.get(st_id, ("", ""))
-                    if (target_tag_id and st_id == target_tag_id) or slug in (symbol, sa_sym_up) or name in (symbol, sa_sym_up):
-                        rating_key = rk
-                        break
-                    if fallback_rk is None:
-                        fallback_rk = rk
-            if rating_key is None:
-                rating_key = fallback_rk
-
-        out.append({
+        author = (item.get("author_name") or item.get("author") or "Seeking Alpha Analyst").strip()
+        pub = format_pub_date(
+            item.get("publish_date") or item.get("published_at") or item.get("date") or ""
+        )
+        raw_rating = (
+            item.get("rating")
+            or item.get("author_rating")
+            or item.get("sentiment")
+        )
+        parsed.append({
             "title_en": title,
             "date": pub,
-            "author": author_name,
-            "rating_key": rating_key,
+            "author": author,
+            "rating_key": normalize_rating_str(raw_rating),
         })
-    return out
+    return parsed
 
 
 def translate_titles_to_zh(titles):
@@ -313,97 +263,134 @@ def load_seeking_alpha_feed(symbol, has_token):
     articles = []
     debug_notes = []
     token = get_apify_token() if has_token else ""
-    sa_sym = symbol.lower().replace(".", "-")
 
     if token:
-        # 通道 A：使用 Apify 官方 Puppeteer 真实 Chrome 浏览器在页面内直接抓取 SA 官网 v3 JSON（免费账户 100% 可用，无需昂贵住宅代理权限！）
-        page_fn = """
-        async function pageFunction(context) {
-            const resp = await context.page.evaluate(async () => {
-                const sym = window.location.pathname.split('/symbol/')[1].split('/')[0];
-                const u = `/api/v3/symbols/${sym}/articles?filter[category]=latest-articles&include=author,sentiments,sentiments.tag,primaryTickers&page[size]=15`;
-                const r = await fetch(u, { credentials: 'same-origin', headers: { 'accept': 'application/json' } });
-                return { status: r.status, body: await r.json() };
-            });
-            return resp;
-        }
-        """
-        pup_input = {
-            "startUrls": [{"url": f"https://seekingalpha.com/symbol/{sa_sym}/analysis"}],
-            "pageFunction": page_fn,
-            "proxyConfiguration": {"useApifyProxy": True},
-            "maxPagesPerCrawl": 1,
-            "maxRequestRetries": 1,
-            "navigationTimeoutSecs": 35,
-        }
+        # 第 1 步（极速秒读）：检查 Apify 账号最近 10 次已跑完的历史记录里有没有同股票现成结果（6小时内）
         try:
-            r_pup = requests.post(
-                "https://api.apify.com/v2/acts/apify~puppeteer-scraper/run-sync-get-dataset-items",
-                params={"token": token},
-                json=pup_input,
-                timeout=(5, 90),
+            runs_url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/runs"
+            r_runs = requests.get(
+                runs_url,
+                params={"token": token, "desc": "true", "limit": 10},
+                timeout=(4, 10),
             )
-            if r_pup.status_code in (200, 201):
-                res_list = r_pup.json()
-                if isinstance(res_list, list) and len(res_list) > 0:
-                    first_item = res_list[0]
-                    v3_body = first_item.get("body") if isinstance(first_item, dict) else None
-                    parsed = parse_v3_json_payload(v3_body, symbol)
-                    if parsed and any(x.get("rating_key") for x in parsed):
-                        articles = parsed
-                        debug_notes.append("通道A(官方浏览器直连v3)成功获取精确评级")
-                    else:
-                        debug_notes.append(f"通道A返回状态:{first_item.get('status') if isinstance(first_item, dict) else '未知'}")
-            else:
-                debug_notes.append(f"通道A HTTP {r_pup.status_code}: {r_pup.text[:120]}")
-        except Exception as e:
-            debug_notes.append(f"通道A异常: {str(e)[:80]}")
+            if r_runs.status_code == 200:
+                run_items = (r_runs.json().get("data") or {}).get("items") or []
+                for run_info in run_items:
+                    r_status = run_info.get("status")
+                    ds_id = run_info.get("defaultDatasetId")
+                    started_at = run_info.get("startedAt")
+                    # 检查是否在最近 12 小时内
+                    is_fresh = True
+                    if started_at:
+                        age_hours = (pd.Timestamp.now("UTC") - pd.to_datetime(started_at, utc=True)).total_seconds() / 3600.0
+                        if age_hours > 12:
+                            is_fresh = False
 
-        # 通道 B：调用 fortuitous_pirate 分析抓取器（强制覆盖默认住宅代理为普通代理，兼容免费账号）
+                    if r_status == "SUCCEEDED" and ds_id and is_fresh:
+                        r_ds = requests.get(
+                            f"https://api.apify.com/v2/datasets/{ds_id}/items",
+                            params={"token": token},
+                            timeout=(4, 10),
+                        )
+                        if r_ds.status_code == 200:
+                            cand = parse_apify_dataset_items(r_ds.json(), symbol)
+                            if cand:
+                                articles = cand
+                                sample_ratings = [c.get("rating_key") for c in cand[:5]]
+                                debug_notes.append(f"命中Apify近期已完成数据集({ds_id[:8]}), 前5篇评级={sample_ratings}")
+                                break
+                    elif r_status == "RUNNING":
+                        # 如果刚才点击触发的任务正在后台运行，直接复用等待它完成，不重复扣费！
+                        run_id = run_info.get("id")
+                        for _ in range(30):
+                            time.sleep(4)
+                            rc = requests.get(
+                                f"https://api.apify.com/v2/actor-runs/{run_id}",
+                                params={"token": token},
+                                timeout=(4, 10),
+                            )
+                            if rc.status_code == 200:
+                                rdata = rc.json().get("data") or {}
+                                if rdata.get("status") == "SUCCEEDED":
+                                    did = rdata.get("defaultDatasetId")
+                                    rds = requests.get(
+                                        f"https://api.apify.com/v2/datasets/{did}/items",
+                                        params={"token": token},
+                                        timeout=(4, 10),
+                                    )
+                                    if rds.status_code == 200:
+                                        cand = parse_apify_dataset_items(rds.json(), symbol)
+                                        if cand:
+                                            articles = cand
+                                            debug_notes.append(f"复用运行中任务完成({run_id[:8]})")
+                                    break
+                                if rdata.get("status") in ("FAILED", "ABORTED", "TIMED-OUT"):
+                                    break
+                        if articles:
+                            break
+        except Exception as e:
+            debug_notes.append(f"查历史记录异常:{str(e)[:60]}")
+
+        # 第 2 步：若没有近期同股票缓存，发起新的异步任务并每 4 秒轮询（最多等 160 秒，彻底告别单次连接超时！）
         if not articles:
-            fp_input = {
+            start_url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/runs"
+            # maxArticles 设为 8 篇，抓取速度加快一倍且更省额度！不强改默认代理配置以确保过盾成功率
+            run_input = {
                 "tickerSymbol": symbol,
                 "analysisType": "analysis",
-                "maxArticles": 12,
-                "proxyConfiguration": {"useApifyProxy": True},
+                "maxArticles": 8,
             }
             try:
-                r_fp = requests.post(
-                    "https://api.apify.com/v2/acts/fortuitous_pirate~seekingalpha-stock-analysis-scraper/run-sync-get-dataset-items",
+                r_start = requests.post(
+                    start_url,
                     params={"token": token},
-                    json=fp_input,
-                    timeout=(5, 85),
+                    json=run_input,
+                    timeout=(5, 15),
                 )
-                if r_fp.status_code in (200, 201):
-                    items = r_fp.json()
-                    if isinstance(items, list) and len(items) > 0:
-                        for item in items:
-                            title = (item.get("article_title") or item.get("title") or "").strip()
-                            if not title:
-                                continue
-                            atype = str(item.get("analysis_type") or "analysis").strip().lower()
-                            aurl = str(item.get("article_url") or item.get("url") or "")
-                            if atype == "news" or ("/news/" in aurl and "/article/" not in aurl):
-                                continue
-                            author = (item.get("author_name") or item.get("author") or "Seeking Alpha Analyst").strip()
-                            pub = format_pub_date(item.get("publish_date") or item.get("published_at") or item.get("date") or "")
-                            raw_rating = item.get("rating") or item.get("author_rating") or item.get("sentiment")
-                            articles.append({
-                                "title_en": title,
-                                "date": pub,
-                                "author": author,
-                                "rating_key": normalize_rating_str(raw_rating),
-                            })
-                        if articles:
-                            debug_notes.append("通道B(SA分析器)成功返回")
-                    else:
-                        debug_notes.append("通道B返回空数组")
-                else:
-                    debug_notes.append(f"通道B HTTP {r_fp.status_code}: {r_fp.text[:120]}")
-            except Exception as e:
-                debug_notes.append(f"通道B异常: {str(e)[:80]}")
+                if r_start.status_code in (200, 201):
+                    run_data = r_start.json().get("data") or {}
+                    run_id = run_data.get("id")
+                    ds_id = run_data.get("defaultDatasetId")
+                    final_status = "RUNNING"
 
-    # 通道 C（无评级保底）：Seeking Alpha 官方 XML 分析流
+                    for _ in range(40):  # 40 * 4秒 = 最多稳等 160 秒
+                        time.sleep(4)
+                        r_poll = requests.get(
+                            f"https://api.apify.com/v2/actor-runs/{run_id}",
+                            params={"token": token},
+                            timeout=(4, 10),
+                        )
+                        if r_poll.status_code == 200:
+                            pdata = r_poll.json().get("data") or {}
+                            final_status = pdata.get("status")
+                            ds_id = pdata.get("defaultDatasetId") or ds_id
+                            if final_status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
+                                break
+
+                    if final_status == "SUCCEEDED" and ds_id:
+                        r_items = requests.get(
+                            f"https://api.apify.com/v2/datasets/{ds_id}/items",
+                            params={"token": token},
+                            timeout=(4, 12),
+                        )
+                        if r_items.status_code == 200:
+                            raw_json = r_items.json()
+                            cand = parse_apify_dataset_items(raw_json, symbol)
+                            if cand:
+                                articles = cand
+                                sample_keys = list(raw_json[0].keys()) if isinstance(raw_json, list) and raw_json else []
+                                sample_ratings = [c.get("rating_key") for c in cand[:5]]
+                                debug_notes.append(f"新任务成功! 字段={sample_keys}, 前5评级={sample_ratings}")
+                            else:
+                                debug_notes.append(f"任务成功但返回条目数={len(raw_json) if isinstance(raw_json, list) else 0}")
+                    else:
+                        debug_notes.append(f"Apify任务结束状态={final_status}")
+                else:
+                    debug_notes.append(f"启动Apify返回HTTP {r_start.status_code}: {r_start.text[:120]}")
+            except Exception as e:
+                debug_notes.append(f"轮询异常:{str(e)[:80]}")
+
+    # 保底通道：官方 XML 分析流
     if not articles:
         sa_xml_url = f"https://seekingalpha.com/api/sa/combined/{symbol}.xml"
         try:
@@ -434,9 +421,9 @@ def load_seeking_alpha_feed(symbol, has_token):
                             "author": author or "Seeking Alpha Analyst",
                             "rating_key": None,
                         })
-                    if len(articles) >= 12:
+                    if len(articles) >= 10:
                         break
-                debug_notes.append("当前使用通道C(官方XML流,不含评级字段)")
+                debug_notes.append("回退官方XML流(不含评级)")
         except Exception:
             pass
 
@@ -816,7 +803,7 @@ with row1_right:
 
         if ticker:
             spinner_msg = (
-                f"正在通过云端浏览器同步 {ticker} 官网评级（首次约需 20~35 秒，之后 6 小时秒开）..."
+                f"正在从 Seeking Alpha 同步 {ticker} 分析师评级（新股票首次约 40~90 秒，已有记录秒开）..."
                 if has_apify else "正在拉取 Seeking Alpha 分析列表..."
             )
             with st.spinner(spinner_msg):
