@@ -10,6 +10,12 @@ import html
 # 请把邮箱改成你自己的（SEC 要求）
 HEADERS = {"User-Agent": "PE-Website aihuaxiawenhua@gmail.com"}
 
+# 你的 Seeking Alpha 专属推广链接
+SA_REFERRAL_URL = (
+    "https://seekingalpha.com/subscriptions/refer-a-friend"
+    "?source=refer_friend_link&user_referrer=91b69c96c70651cc37407aca"
+)
+
 st.set_page_config(page_title="美股估值看板", layout="wide")
 
 st.markdown("""
@@ -56,7 +62,7 @@ st.markdown("""
         text-decoration: none;
         font-size: 0.88rem;
         font-weight: 500;
-        line-height: 1.35;
+        line-height: 1.4;
         display: block;
     }
     .sa-item a:hover {
@@ -114,12 +120,56 @@ def format_pub_date(raw_date):
         return raw_date[:16]
 
 
+def translate_titles_to_zh(titles):
+    """使用免费 Google Translate 接口批量将英文标题翻译为简体中文（合并请求速度快）"""
+    if not titles:
+        return titles
+    sep = "\n ||| \n"
+    joined = sep.join(titles)
+    try:
+        r = requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={
+                "client": "gtx",
+                "sl": "en",
+                "tl": "zh-CN",
+                "dt": "t",
+                "q": joined,
+            },
+            timeout=10,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            translated_full = "".join(seg[0] for seg in data[0] if seg and seg[0])
+            parts = [p.strip() for p in translated_full.split("|||")]
+            if len(parts) == len(titles):
+                return parts
+    except Exception:
+        pass
+
+    # 若合并切分数量不一致，逐条兜底翻译
+    res = []
+    for t in titles:
+        zh = t
+        try:
+            r = requests.get(
+                "https://translate.googleapis.com/translate_a/single",
+                params={"client": "gtx", "sl": "en", "tl": "zh-CN", "dt": "t", "q": t},
+                timeout=5,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                zh = "".join(seg[0] for seg in data[0] if seg and seg[0]).strip() or t
+        except Exception:
+            pass
+        res.append(zh)
+    return res
+
+
 @st.cache_data(ttl=1800)
 def load_seeking_alpha_feed(symbol):
     """
-    获取某只股票在 Seeking Alpha 上的最新分析列表（缓存 30 分钟）：
-    优先走 Seeking Alpha 官方按股票订阅 RSS（优先筛选 Analysis 深度分析文章），
-    若云服务器 IP 被防爬拦截，则自动无缝回退到 Google News 的 site:seekingalpha.com 源。
+    获取某只股票在 Seeking Alpha 上的最新分析列表（缓存 30 分钟），并将标题自动译为中文。
     """
     browser_headers = {
         "User-Agent": (
@@ -142,27 +192,25 @@ def load_seeking_alpha_feed(symbol):
             all_items = []
             for item in root.findall("./channel/item"):
                 title = (item.findtext("title") or "").strip()
-                link = (item.findtext("link") or "").strip()
+                orig_link = (item.findtext("link") or "").strip()
                 pub = format_pub_date(item.findtext("pubDate") or "")
                 author = (item.findtext("sa:author_name", namespaces=ns) or "").strip()
-                is_article = "/article/" in link
-                if title and link:
+                is_article = "/article/" in orig_link
+                if title:
                     all_items.append({
-                        "title": title,
-                        "link": link,
+                        "title_en": title,
                         "date": pub,
                         "author": author or "Seeking Alpha",
                         "kind": "深度分析" if is_article else "快讯/动态",
                         "is_article": is_article,
                     })
-            # 优先展示深度分析（/article/），不够再用快讯补齐
             only_analysis = [x for x in all_items if x["is_article"]]
             other_news = [x for x in all_items if not x["is_article"]]
             articles = (only_analysis + other_news)[:15]
     except Exception:
         pass
 
-    # 通道 2（兜底）：若官方 XML 被拦截或为空，通过 Google News RSS 精准检索 Seeking Alpha 分析页
+    # 通道 2（兜底）：通过 Google News RSS 精准检索 Seeking Alpha 分析页
     if not articles:
         gn_url = (
             f"https://news.google.com/rss/search?"
@@ -174,14 +222,11 @@ def load_seeking_alpha_feed(symbol):
                 root = ET.fromstring(r.content)
                 for item in root.findall("./channel/item")[:15]:
                     raw_title = (item.findtext("title") or "").strip()
-                    # 去掉末尾重复的 " - Seeking Alpha"
                     clean_title = raw_title.rsplit(" - Seeking Alpha", 1)[0].strip()
-                    link = (item.findtext("link") or "").strip()
                     pub = format_pub_date(item.findtext("pubDate") or "")
-                    if clean_title and link:
+                    if clean_title:
                         articles.append({
-                            "title": clean_title,
-                            "link": link,
+                            "title_en": clean_title,
                             "date": pub,
                             "author": "Seeking Alpha Analyst",
                             "kind": "深度分析",
@@ -189,6 +234,12 @@ def load_seeking_alpha_feed(symbol):
                         })
         except Exception:
             pass
+
+    # 批量翻译英文标题为简体中文
+    if articles:
+        zh_titles = translate_titles_to_zh([a["title_en"] for a in articles])
+        for art, zh in zip(articles, zh_titles):
+            art["title_zh"] = zh
 
     return articles
 
@@ -510,43 +561,46 @@ with row1_left:
                 )
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-# 【右上角】：Seeking Alpha 最新分析列表
+# 【右上角】：Seeking Alpha 最新分析列表（中文标题 + 专属推广链接）
 with row1_right:
     with st.container(border=True):
-        sa_head1, sa_head2 = st.columns([3, 1])
+        safe_ref_url = html.escape(SA_REFERRAL_URL, quote=True)
+        sa_head1, sa_head2 = st.columns([2.8, 1.2])
         with sa_head1:
             st.markdown(f"**📰 Seeking Alpha 最新分析 ({ticker})**")
         with sa_head2:
-            sa_page_url = f"https://seekingalpha.com/symbol/{ticker}/analysis"
             st.markdown(
                 f"<div style='text-align:right; font-size:0.8rem;'>"
-                f"<a href='{sa_page_url}' target='_blank' style='text-decoration:none;'>查看全部 ↗</a></div>",
+                f"<a href='{safe_ref_url}' target='_blank' rel='noopener noreferrer' "
+                f"style='text-decoration:none; color:#e66a00; font-weight:600;'>订阅优惠解锁 ↗</a></div>",
                 unsafe_allow_html=True,
             )
 
         if ticker:
-            with st.spinner("正在拉取 Seeking Alpha 分析列表..."):
+            with st.spinner("正在拉取并翻译 Seeking Alpha 分析列表..."):
                 sa_articles = load_seeking_alpha_feed(ticker)
 
             if not sa_articles:
-                st.markdown("""
+                st.markdown(f"""
                     <div class="placeholder-box">
                         <div>📭 暂未获取到该代码的最新 Seeking Alpha 分析文章</div>
-                        <div style="font-size: 0.8rem; margin-top: 6px;">可点击右上角“查看全部”前往官网浏览</div>
+                        <div style="font-size: 0.8rem; margin-top: 6px;">
+                            <a href="{safe_ref_url}" target="_blank" rel="noopener noreferrer">点击前往 Seeking Alpha 官网查看 ↗</a>
+                        </div>
                     </div>
                 """, unsafe_allow_html=True)
             else:
                 items_html = []
                 for art in sa_articles:
-                    safe_title = html.escape(art["title"])
+                    safe_title_zh = html.escape(art.get("title_zh") or art["title_en"])
+                    safe_title_en = html.escape(art["title_en"], quote=True)
                     safe_author = html.escape(art["author"])
                     safe_date = html.escape(art["date"])
                     safe_kind = html.escape(art["kind"])
-                    safe_link = html.escape(art["link"], quote=True)
                     items_html.append(
                         f'<div class="sa-item">'
-                        f'<a href="{safe_link}" target="_blank" rel="noopener noreferrer">'
-                        f'<span class="sa-badge">{safe_kind}</span>{safe_title}</a>'
+                        f'<a href="{safe_ref_url}" target="_blank" rel="noopener noreferrer" title="{safe_title_en}">'
+                        f'<span class="sa-badge">{safe_kind}</span>{safe_title_zh}</a>'
                         f'<div class="sa-meta">✍️ {safe_author} &nbsp;·&nbsp; 🕒 {safe_date}</div>'
                         f'</div>'
                     )
