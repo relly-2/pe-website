@@ -575,6 +575,38 @@ def fetch_dataset_items(token, ds_id):
     return []
 
 
+_SSR_RATING_PAT = (
+    r'"(?:type|rating|slug|label|name)"\s*:\s*"'
+    r'(strong[_ -]?buy|very[_ -]?bullish|buy|bullish|hold|neutral|'
+    r'sell|bearish|strong[_ -]?sell|very[_ -]?bearish)"'
+)
+
+
+def _row_debug(row):
+    """把单篇文章实际抓到的内容整理成可读的诊断文本。"""
+    cap = row.get("capturedV3")
+    if isinstance(cap, dict):
+        inc = [it for it in (cap.get("included") or []) if isinstance(it, dict)]
+        sent = [
+            it for it in inc
+            if any(w in str(it.get("type") or "").lower() for w in ("sentiment", "rating"))
+        ]
+        v3_txt = f"v3截获(included {len(inc)}项, 情绪对象{len(sent)}个)"
+        if sent:
+            v3_txt += " 样例=" + json.dumps(sent[0], ensure_ascii=False)[:260]
+    else:
+        v3_txt = "v3未截获"
+
+    raw = str(row.get("ssrSnippet") or "")
+    parts = [p for p in raw.split(" ### ") if p]
+    cands = [
+        m.group(1).lower()
+        for m in re.finditer(_SSR_RATING_PAT, raw.replace('\\"', '"'), flags=re.IGNORECASE)
+    ]
+    samples = "\n   ‖ ".join(p[150:420] for p in parts[:3])
+    return v3_txt, len(parts), cands, samples
+
+
 def parse_dataset_array(arr, symbol, schema_ver):
     if not isinstance(arr, list) or not arr:
         return [], "数据集暂无记录"
@@ -588,24 +620,43 @@ def parse_dataset_array(arr, symbol, schema_ver):
         return [], f"非当前股票{schema_ver}记录"
 
     valid_rows.sort(key=lambda r: int(r.get("order", 999)))
-    out = []
-    first_diag = ""
+    out, lines, details = [], [], []
     blocked_cnt = 0
+    shown_rated = 0
+    shown_unrated = 0
 
     for idx, row in enumerate(valid_rows):
         if row.get("blocked"):
             blocked_cnt += 1
-        rk = extract_rating_from_single_article_v3(row.get("capturedV3"), symbol)
-        if not rk and row.get("ssrSnippet"):
-            rk = extract_rating_from_ssr_snippet(row.get("ssrSnippet"))
 
-        if idx == 0:
-            has_cap = bool(row.get("capturedV3"))
-            ssr_snip = (row.get("ssrSnippet") or "")[:220]
-            head_txt = (row.get("headText") or "")[:120]
-            first_diag = (
-                f"首篇: 被拦截={bool(row.get('blocked'))}, 截获v3={has_cap}, "
-                f"ssr={ssr_snip}, 头部={head_txt}"
+        src = ""
+        rk = extract_rating_from_single_article_v3(row.get("capturedV3"), symbol)
+        if rk:
+            src = "v3"
+        elif row.get("ssrSnippet"):
+            rk = extract_rating_from_ssr_snippet(row.get("ssrSnippet"))
+            if rk:
+                src = "ssr"
+
+        v3_txt, n_parts, cands, samples = _row_debug(row)
+        title = str(row.get("title_en") or "")[:50]
+        lines.append(
+            f"#{idx + 1} 评级={rk or '无'}{'(' + src + ')' if src else ''} | {v3_txt} | "
+            f"ssr片段{n_parts}个, 候选={cands} | {title}"
+        )
+
+        # 原始片段：打印 1 篇有评级的 + 前 2 篇没评级的
+        show = False
+        if rk and shown_rated < 1:
+            shown_rated += 1
+            show = True
+        elif not rk and shown_unrated < 2:
+            shown_unrated += 1
+            show = True
+        if show:
+            head_txt = str(row.get("headText") or "")[:150]
+            details.append(
+                f"—— #{idx + 1} 原始内容 ——\n头部: {head_txt}\nssr: {samples or '(空)'}"
             )
 
         out.append({
@@ -616,10 +667,14 @@ def parse_dataset_array(arr, symbol, schema_ver):
         })
 
     ratings_preview = [x.get("rating_key") for x in out[:5]]
-    diag = f"前5评级={ratings_preview}, 被反爬拦截={blocked_cnt}/{len(valid_rows)}篇"
-    if not any(x.get("rating_key") for x in out):
-        diag += f" | {first_diag}"
+    diag = (
+        f"前5评级={ratings_preview}, 被反爬拦截={blocked_cnt}/{len(valid_rows)}篇\n"
+        + "\n".join(lines) + "\n" + "\n".join(details)
+    )
     return out, diag
+
+
+
 
 
 def _resolve_run(token, symbol, schema_ver, run_id, ds_id, max_wait):
@@ -1177,6 +1232,8 @@ if detail_meta is not None:
 
 # 诊断信息：始终显示（个股 / ETF / PE 加载失败时都能看到）
 if sa_debug_msg:
-    st.caption(f"📡 Seeking Alpha 数据通道状态：{sa_debug_msg}")
+    with st.expander("📡 Seeking Alpha 数据通道状态", expanded=True):
+        st.code(sa_debug_msg, language=None)
+
 
 st.caption("数据来源：Yahoo Finance、SEC EDGAR、Seeking Alpha，仅供参考，不构成投资建议。")
