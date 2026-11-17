@@ -20,7 +20,7 @@ SA_REFERRAL_URL = (
 )
 
 PUPPETEER_ACTOR_ID = "apify~puppeteer-scraper"
-CACHE_SCHEMA_VER = "v3"
+CACHE_SCHEMA_VER = "v4"
 
 st.set_page_config(page_title="美股估值看板", layout="wide")
 
@@ -59,7 +59,6 @@ st.markdown("""
     }
     .sa-item {
         padding: 8px 4px;
-        border-bottom: 1px solid rgba(128, 1px, 128, 0.16);
         border-bottom: 1px solid rgba(128, 128, 128, 0.16);
     }
     .sa-item:last-child {
@@ -161,7 +160,6 @@ def format_pub_date(raw_date):
     except Exception:
         pass
 
-    # 去掉星期前缀（如 "Sat, Nov. 14" -> "Nov 14"）以便精确补齐当前年份
     clean_s = re.sub(r"^[A-Za-z]{3},\s*", "", s).replace(".", "").strip()
     if not re.search(r"\b(19|20)\d{2}\b", clean_s):
         clean_s = f"{clean_s}, {now_dt.year}"
@@ -223,7 +221,6 @@ def normalize_rating_str(raw_rating, allow_numeric=False):
 
 
 def extract_rating_from_single_article_v3(art_json, symbol):
-    """从单篇文章详情 /api/v3/articles/{id} 的 JSON 中精准提取当前股票评级"""
     if not isinstance(art_json, dict):
         return None
     included = art_json.get("included") or []
@@ -265,7 +262,6 @@ def extract_rating_from_single_article_v3(art_json, symbol):
                 if fallback_rk is None:
                     fallback_rk = rk
 
-    # 兜底检查 data.attributes 自身字段
     d_attrs = data_obj.get("attributes") or {}
     for k, v in d_attrs.items():
         if any(w in k.lower() for w in ("sent", "rat")) and isinstance(v, (str, int)):
@@ -306,22 +302,32 @@ def get_apify_token():
         return ""
 
 
-def run_puppeteer_v3_details(token, symbol, proxy_cfg):
+def run_puppeteer_v4_details(token, symbol, proxy_cfg):
     sa_sym = symbol.lower().replace(".", "-")
-    # 核心突破：在已过盾的同源浏览器中提取前 10 篇分析文章 ID，并并发请求每篇文章的 /api/v3/articles/{id}?include=sentiments,sentiments.tag 详情接口！
-    page_fn = """
+    # 使用 r""" 原始字符串且零正则转义，确保 JS 100% 语法安全
+    page_fn = r"""
     async function pageFunction(context) {
         const { page, request } = context;
         const sym = request.userData.symbol || 'AAPL';
 
-        // 等待文章列表渲染完成
         try {
             await page.waitForSelector('article', { timeout: 15000 });
         } catch (e) {}
         await new Promise(r => setTimeout(r, 2000));
 
-        // 1. 从分析列表提取前 10 篇文章的标题、作者、日期以及 articleId
         const cards = await page.evaluate(() => {
+            function extractArticleId(href) {
+                if (!href || href.indexOf('/article/') === -1) return '';
+                const tail = href.split('/article/')[1] || '';
+                let digits = '';
+                for (let i = 0; i < tail.length; i++) {
+                    const ch = tail[i];
+                    if (ch >= '0' && ch <= '9') digits += ch;
+                    else break;
+                }
+                return digits;
+            }
+
             const items = Array.from(document.querySelectorAll('article'));
             const out = [];
             const seen = new Set();
@@ -329,10 +335,8 @@ def run_puppeteer_v3_details(token, symbol, proxy_cfg):
                 const aTitle = el.querySelector('a[data-test-id="post-list-item-title"], h3 a, a[href*="/article/"]');
                 if (!aTitle) continue;
                 const href = aTitle.getAttribute('href') || '';
-                const m = href.match(/\\/article\\/(\\d+)/);
-                if (!m) continue;
-                const aid = m[[1]](#__1);
-                if (seen.has(aid)) continue;
+                const aid = extractArticleId(href);
+                if (!aid || seen.has(aid)) continue;
                 seen.add(aid);
 
                 const title = (aTitle.textContent || '').trim();
@@ -352,16 +356,19 @@ def run_puppeteer_v3_details(token, symbol, proxy_cfg):
             return out;
         });
 
-        // 2. 在同源浏览器内并发拉取每篇文章的原生详情 API：/api/v3/articles/{id}?include=sentiments,sentiments.tag,author
         const enriched = await page.evaluate(async (cardList) => {
             const tasks = cardList.map(async (c) => {
                 let detailJson = null;
                 let detailStatus = 0;
-                let htmlRating = null;
 
-                for (const inc of ['sentiments,sentiments.tag,author', 'sentiments']) {
+                const urls = [
+                    '/api/v3/articles/' + c.id + '?include=sentiments,sentiments.tag,author,primaryTickers',
+                    '/api/v3/articles/' + c.id + '?include=sentiments',
+                    '/api/v3/articles/' + c.id
+                ];
+                for (const u of urls) {
                     try {
-                        const r = await fetch(`/api/v3/articles/${c.id}?include=${inc}`, {
+                        const r = await fetch(u, {
                             credentials: 'same-origin',
                             headers: { 'accept': 'application/json' }
                         });
@@ -373,50 +380,35 @@ def run_puppeteer_v3_details(token, symbol, proxy_cfg):
                     } catch (e) {}
                 }
 
-                // 若 v3 接口未带 sentiments，再快速检查无 include 的默认文章详情接口
-                if (!detailJson) {
-                    try {
-                        const r2 = await fetch(`/api/v3/articles/${c.id}`, {
-                            credentials: 'same-origin',
-                            headers: { 'accept': 'application/json' }
-                        });
-                        detailStatus = r2.status;
-                        if (r2.status === 200) {
-                            detailJson = await r2.json();
-                        }
-                    } catch (e) {}
-                }
-
-                // 精简保存关键字段（减小体积并保留第1篇完整结构供核对）
                 let slimDetail = null;
                 if (detailJson) {
+                    const dObj = detailJson.data || {};
+                    const dAttrs = dObj.attributes || {};
                     slimDetail = {
                         included: detailJson.included || [],
                         data: {
-                            id: (detailJson.data || {}).id,
+                            id: dObj.id,
                             attributes: {
-                                publishOn: ((detailJson.data || {}).attributes || {}).publishOn,
-                                title: ((detailJson.data || {}).attributes || {}).title,
-                                sentiments: ((detailJson.data || {}).attributes || {}).sentiments,
-                                rating: ((detailJson.data || {}).attributes || {}).rating
+                                publishOn: dAttrs.publishOn,
+                                title: dAttrs.title,
+                                sentiments: dAttrs.sentiments,
+                                rating: dAttrs.rating
                             },
-                            relationships: ((detailJson.data || {}).relationships || {})
+                            relationships: dObj.relationships || {}
                         }
                     };
                 }
 
-                return {
-                    ...c,
-                    detailStatus,
-                    detail: slimDetail,
-                    htmlRating
-                };
+                return Object.assign({}, c, {
+                    detailStatus: detailStatus,
+                    detail: slimDetail
+                });
             });
             return await Promise.all(tasks);
         }, cards);
 
         return {
-            schema: 'v3',
+            schema: 'v4',
             symbol: sym.toUpperCase(),
             count: enriched.length,
             items: enriched
@@ -474,10 +466,23 @@ def run_puppeteer_v3_details(token, symbol, proxy_cfg):
             arr = ri.json()
             if isinstance(arr, list) and arr and isinstance(arr[0], dict):
                 return arr[0], f"SUCCEEDED(run={run_id[:8]})"
-    return None, f"状态={f_status}"
+
+    err_tail = ""
+    try:
+        rlog = requests.get(
+            f"https://api.apify.com/v2/logs/{run_id}",
+            params={"token": token},
+            timeout=(4, 8),
+        )
+        if rlog.status_code == 200 and rlog.text:
+            lines = [ln.strip() for ln in rlog.text.splitlines() if "ERROR" in ln or "Error" in ln]
+            err_tail = (lines[-1] if lines else rlog.text[-160:]).strip()
+    except Exception:
+        pass
+    return None, f"状态={f_status}({err_tail[:140]})"
 
 
-def parse_v3_enriched_record(rec, symbol):
+def parse_v4_enriched_record(rec, symbol):
     items = rec.get("items") or []
     out = []
     statuses = []
@@ -499,8 +504,6 @@ def parse_v3_enriched_record(rec, symbol):
         author = (it.get("author") or "Seeking Alpha Analyst").strip()
 
         rk = extract_rating_from_single_article_v3(detail, symbol)
-        if not rk and it.get("htmlRating"):
-            rk = normalize_rating_str(it.get("htmlRating"))
 
         if idx == 0 and isinstance(detail, dict):
             inc = detail.get("included") or []
@@ -529,7 +532,6 @@ def load_seeking_alpha_feed(symbol, has_token, _schema=CACHE_SCHEMA_VER):
     token = get_apify_token() if has_token else ""
 
     if token:
-        # 1. 先检查最近 6 小时内是否已有 schema=='v3' 的同股票缓存结果
         try:
             r_hist = requests.get(
                 f"https://api.apify.com/v2/acts/{PUPPETEER_ACTOR_ID}/runs",
@@ -555,30 +557,28 @@ def load_seeking_alpha_feed(symbol, has_token, _schema=CACHE_SCHEMA_VER):
                             arr = rds.json()
                             if isinstance(arr, list) and arr and isinstance(arr[0], dict):
                                 rec = arr[0]
-                                if rec.get("schema") == "v3" and str(rec.get("symbol") or "").upper() == symbol:
-                                    cand, diag = parse_v3_enriched_record(rec, symbol)
+                                if rec.get("schema") == "v4" and str(rec.get("symbol") or "").upper() == symbol:
+                                    cand, diag = parse_v4_enriched_record(rec, symbol)
                                     if cand:
                                         articles = cand
-                                        debug_notes.append(f"命中v3缓存({ds_id[:8]}) | {diag}")
+                                        debug_notes.append(f"命中v4缓存({ds_id[:8]}) | {diag}")
                                         break
         except Exception:
             pass
 
-        # 2. 若无 v3 缓存，启动住宅代理并发读取单篇详情接口
         if not articles:
             proxy_cfg = {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]}
             try:
-                rec, note = run_puppeteer_v3_details(token, symbol, proxy_cfg)
-                debug_notes.append(f"住宅代理v3:{note}")
+                rec, note = run_puppeteer_v4_details(token, symbol, proxy_cfg)
+                debug_notes.append(f"住宅代理v4:{note}")
                 if rec:
-                    cand, diag = parse_v3_enriched_record(rec, symbol)
+                    cand, diag = parse_v4_enriched_record(rec, symbol)
                     debug_notes.append(diag)
                     if cand:
                         articles = cand
             except Exception as e:
-                debug_notes.append(f"v3异常:{str(e)[:60]}")
+                debug_notes.append(f"v4异常:{str(e)[:60]}")
 
-    # 保底通道
     if not articles:
         sa_xml_url = f"https://seekingalpha.com/api/sa/combined/{symbol}.xml"
         try:
