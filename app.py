@@ -20,7 +20,12 @@ SA_REFERRAL_URL = (
 )
 
 PUPPETEER_ACTOR_ID = "apify~puppeteer-scraper"
-CACHE_SCHEMA_VER = "v4"
+CACHE_SCHEMA_VER = "v6"          # 升级版本号，旧的 v5 失败数据集不再被复用
+SA_FAIL_RETRY_SECS = 900         # 抓评级失败后，15 分钟内不重复启动 Apify
+SA_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 st.set_page_config(page_title="美股估值看板", layout="wide")
 
@@ -194,29 +199,31 @@ RATING_MAP = {
     "very bearish": ("强烈卖出", "sa-strong-sell"),
 }
 
-SA_SENTIMENT_ID_MAP = {
-    "1": "buy",
-    "2": "hold",
-    "3": "sell",
-    "4": "strong_buy",
-    "5": "strong_sell",
-}
 
-
-def normalize_rating_str(raw_rating, allow_numeric=False):
+def normalize_rating_str(raw_rating):
+    """只认明确的文字评级；不再把数字 ID 猜成评级（宁可不显示，也不显示错）。"""
     if raw_rating is None or isinstance(raw_rating, bool):
         return None
     s = str(raw_rating).strip().lower()
     if not s or s in ("none", "n/a", "null", "unknown", "no rating"):
         return None
-    if allow_numeric and s in SA_SENTIMENT_ID_MAP:
-        return SA_SENTIMENT_ID_MAP[s]
     k_space = s.replace("-", " ").replace("_", " ")
     k_under = k_space.replace(" ", "_")
     if k_space in RATING_MAP:
         return k_space
     if k_under in RATING_MAP:
         return k_under
+    return None
+
+
+def pick_unambiguous_rating(rating_keys):
+    """多个候选评级时：全部一致才采用，互相矛盾则放弃。"""
+    keys = [k for k in rating_keys if k in RATING_MAP]
+    if not keys:
+        return None
+    labels = {RATING_MAP[k][0] for k in keys}
+    if len(labels) == 1:
+        return keys[0]
     return None
 
 
@@ -229,47 +236,63 @@ def extract_rating_from_single_article_v3(art_json, symbol):
 
     tags_by_id = {}
     for it in included:
-        if it.get("type") == "tag":
+        if isinstance(it, dict) and it.get("type") == "tag":
             tid = str(it.get("id") or "")
             attrs = it.get("attributes") or {}
             slug = str(attrs.get("slug") or "").upper()
             name = str(attrs.get("name") or "").upper()
             tags_by_id[tid] = (slug, name)
 
-    fallback_rk = None
+    unmatched = []
     for it in included:
+        if not isinstance(it, dict):
+            continue
         itype = str(it.get("type") or "").lower()
-        if "sentiment" in itype or "rating" in itype:
-            attrs = it.get("attributes") or {}
-            rk = None
-            for fld in ("type", "rating", "label", "slug", "sentimentId", "sentiment_id"):
-                is_num = "id" in fld.lower()
-                rk = normalize_rating_str(attrs.get(fld), allow_numeric=is_num)
-                if rk:
-                    break
-            if not rk:
-                for k, v in attrs.items():
-                    if isinstance(v, (str, int)):
-                        rk = normalize_rating_str(v, allow_numeric=("id" in k.lower()))
-                        if rk:
-                            break
+        if "sentiment" not in itype and "rating" not in itype:
+            continue
+        attrs = it.get("attributes") or {}
+        rk = None
+        for fld in ("type", "rating", "label", "slug", "name"):
+            rk = normalize_rating_str(attrs.get(fld))
             if rk:
-                rels = it.get("relationships") or {}
-                tag_id = str((rels.get("tag", {}).get("data") or {}).get("id") or "")
-                slug, name = tags_by_id.get(tag_id, ("", ""))
-                if slug in (symbol, sa_sym_up) or name in (symbol, sa_sym_up):
-                    return rk
-                if fallback_rk is None:
-                    fallback_rk = rk
+                break
+        if not rk:
+            continue
+        rels = it.get("relationships") or {}
+        tag_data = (rels.get("tag") or {}).get("data") or {}
+        tag_id = str(tag_data.get("id") or "") if isinstance(tag_data, dict) else ""
+        slug, name = tags_by_id.get(tag_id, ("", ""))
+        if slug in (symbol, sa_sym_up) or name in (symbol, sa_sym_up):
+            return rk  # 明确对应当前股票的评级
+        unmatched.append(rk)
 
     d_attrs = data_obj.get("attributes") or {}
-    for k, v in d_attrs.items():
-        if any(w in k.lower() for w in ("sent", "rat")) and isinstance(v, (str, int)):
-            rk = normalize_rating_str(v, allow_numeric=("id" in k.lower()))
+    for k in ("rating", "sentiment"):
+        v = d_attrs.get(k)
+        if isinstance(v, str):
+            rk = normalize_rating_str(v)
             if rk:
                 return rk
 
-    return fallback_rk
+    # 无法按股票匹配时：只有全部一致才采用（避免多股票文章张冠李戴）
+    return pick_unambiguous_rating(unmatched)
+
+
+def extract_rating_from_ssr_snippet(snippet):
+    if not snippet:
+        return None
+    s = str(snippet).replace('\\"', '"')
+    pat = (
+        r'"(?:type|rating|slug|label|name)"\s*:\s*"'
+        r'(strong[_ -]?buy|very[_ -]?bullish|buy|bullish|hold|neutral|'
+        r'sell|bearish|strong[_ -]?sell|very[_ -]?bearish)"'
+    )
+    found = []
+    for m in re.finditer(pat, s, flags=re.IGNORECASE):
+        rk = normalize_rating_str(m.group(1))
+        if rk:
+            found.append(rk)
+    return pick_unambiguous_rating(found)
 
 
 def translate_titles_to_zh(titles):
@@ -302,132 +325,185 @@ def get_apify_token():
         return ""
 
 
-def run_puppeteer_v4_details(token, symbol, proxy_cfg):
-    sa_sym = symbol.lower().replace(".", "-")
-    # 使用 r""" 原始字符串且零正则转义，确保 JS 100% 语法安全
+def fetch_sa_xml_articles(symbol, limit):
+    """从 Seeking Alpha 官方 XML 取最新分析文章清单（不含评级）。"""
+    out = []
+    rx = requests.get(
+        f"https://seekingalpha.com/api/sa/combined/{symbol}.xml",
+        headers={"User-Agent": SA_BROWSER_UA},
+        timeout=(4, 10),
+    )
+    if rx.status_code != 200 or not rx.content:
+        return out
+    root = ET.fromstring(rx.content)
+    ns = {"sa": "https://seekingalpha.com/api/1.0"}
+    for item in root.findall("./channel/item"):
+        orig_link = (item.findtext("link") or "").strip()
+        if "/article/" not in orig_link:
+            continue
+        title = (item.findtext("title") or "").strip()
+        if not title or title.lower().startswith("wall street breakfast"):
+            continue
+        pub = format_pub_date(item.findtext("pubDate") or "")
+        author = (item.findtext("sa:author_name", namespaces=ns) or "").strip()
+        out.append({
+            "order": len(out),
+            "url": orig_link.split("?")[0],
+            "title_en": title,
+            "date": pub,
+            "author": author or "Seeking Alpha Analyst",
+            "rating_key": None,
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def finalize_articles(articles):
+    """补充中文标题与评级徽章字段。"""
+    if not articles:
+        return articles
+    zh_titles = translate_titles_to_zh([a["title_en"] for a in articles])
+    for art, zh in zip(articles, zh_titles):
+        art["title_zh"] = zh
+        rk = art.get("rating_key")
+        if rk and rk in RATING_MAP:
+            label, css_cls = RATING_MAP[rk]
+            art["rating_label"] = label
+            art["rating_cls"] = css_cls
+        else:
+            art["rating_label"] = None
+            art["rating_cls"] = None
+    return articles
+
+
+def run_puppeteer_real_pages(token, symbol, schema_ver):
+    """
+    1. 从官方 XML 取最新 8 篇分析文章 URL；
+    2. 交给 Apify Puppeteer 打开真实文章页；
+    3. 截获页面自身的 /api/v3/articles/{id} 响应 + 收集 SSR 内嵌的 sentiment 片段；
+    4. 检测反爬验证页（PerimeterX），被拦时换会话重试，最后一次仍被拦则如实上报。
+    """
+    base_articles = fetch_sa_xml_articles(symbol, 8)
+    if not base_articles:
+        return None, "XML未找到分析文章"
+
+    start_urls = [
+        {
+            "url": a["url"],
+            "userData": {
+                "schema": schema_ver,
+                "symbol": symbol,
+                "order": a["order"],
+                "title_en": a["title_en"],
+                "date": a["date"],
+                "author": a["author"],
+            },
+        }
+        for a in base_articles
+    ]
+
+    pre_nav_hook = r"""
+    [
+        async (crawlingContext, gotoOptions) => {
+            const { page, request } = crawlingContext;
+            request.userData._capturedV3 = null;
+
+            await page.setRequestInterception(true);
+            page.on('request', (req) => {
+                const rType = req.resourceType();
+                if (['image', 'media', 'font'].includes(rType)) {
+                    req.abort();
+                } else {
+                    req.continue();
+                }
+            });
+
+            page.on('response', async (res) => {
+                try {
+                    if (request.userData._capturedV3) return;                 // 不覆盖已截获的结果
+                    const u = res.url();
+                    if (!/\/api\/v3\/articles\/\d+(\?|$)/.test(u)) return;    // 只认文章本体，排除 /comments 等子接口
+                    if (res.status() !== 200) return;
+                    const jb = await res.json();
+                    if (jb && jb.data && !Array.isArray(jb.data)) {
+                        const a = jb.data.attributes || {};
+                        request.userData._capturedV3 = {
+                            included: jb.included || [],
+                            data: {
+                                id: jb.data.id,
+                                attributes: { sentiments: a.sentiments, rating: a.rating, sentiment: a.sentiment },
+                                relationships: jb.data.relationships || {}
+                            }
+                        };
+                    }
+                } catch (e) {}
+            });
+            gotoOptions.waitUntil = 'domcontentloaded';
+        }
+    ]
+    """
+
     page_fn = r"""
     async function pageFunction(context) {
         const { page, request } = context;
-        const sym = request.userData.symbol || 'AAPL';
+        // 给前端水合渲染及原生 XHR 响应留 2.5 秒
+        await new Promise(r => setTimeout(r, 2500));
 
-        try {
-            await page.waitForSelector('article', { timeout: 15000 });
-        } catch (e) {}
-        await new Promise(r => setTimeout(r, 2000));
+        const info = await page.evaluate(() => {
+            const htmlTxt = document.documentElement.innerHTML || '';
+            const blocked = /px-captcha|press\s*&(amp;)?\s*hold|access to this page has been denied/i.test(htmlTxt);
 
-        const cards = await page.evaluate(() => {
-            function extractArticleId(href) {
-                if (!href || href.indexOf('/article/') === -1) return '';
-                const tail = href.split('/article/')[1] || '';
-                let digits = '';
-                for (let i = 0; i < tail.length; i++) {
-                    const ch = tail[i];
-                    if (ch >= '0' && ch <= '9') digits += ch;
-                    else break;
-                }
-                return digits;
+            // 收集每个 "type":"sentiment" 对象附近的片段（兼容被转义的 \"type\":\"sentiment\"）
+            const snippets = [];
+            const re = /\\?"type\\?"\s*:\s*\\?"sentiment\\?"/g;
+            let m;
+            while ((m = re.exec(htmlTxt)) !== null && snippets.length < 6) {
+                snippets.push(htmlTxt.slice(Math.max(0, m.index - 200), m.index + 300));
             }
 
-            const items = Array.from(document.querySelectorAll('article'));
-            const out = [];
-            const seen = new Set();
-            for (const el of items) {
-                const aTitle = el.querySelector('a[data-test-id="post-list-item-title"], h3 a, a[href*="/article/"]');
-                if (!aTitle) continue;
-                const href = aTitle.getAttribute('href') || '';
-                const aid = extractArticleId(href);
-                if (!aid || seen.has(aid)) continue;
-                seen.add(aid);
-
-                const title = (aTitle.textContent || '').trim();
-                if (!title || title.toLowerCase().startsWith('wall street breakfast')) continue;
-
-                const aAuthor = el.querySelector('a[data-test-id="post-list-author"], a[href*="/author/"]');
-                const tDate = el.querySelector('span[data-test-id="post-list-date"], time');
-                out.push({
-                    id: aid,
-                    href: href,
-                    title: title,
-                    author: aAuthor ? aAuthor.textContent.trim() : 'Seeking Alpha Analyst',
-                    date: tDate ? (tDate.getAttribute('datetime') || tDate.textContent.trim()) : ''
-                });
-                if (out.length >= 10) break;
-            }
-            return out;
+            const headerEl = document.querySelector('article') || document.body;
+            return {
+                blocked: blocked,
+                ssrSnippet: snippets.join(' ### '),
+                headText: (headerEl.innerText || '').replace(/\s+/g, ' ').slice(0, 360)
+            };
         });
 
-        const enriched = await page.evaluate(async (cardList) => {
-            const tasks = cardList.map(async (c) => {
-                let detailJson = null;
-                let detailStatus = 0;
-
-                const urls = [
-                    '/api/v3/articles/' + c.id + '?include=sentiments,sentiments.tag,author,primaryTickers',
-                    '/api/v3/articles/' + c.id + '?include=sentiments',
-                    '/api/v3/articles/' + c.id
-                ];
-                for (const u of urls) {
-                    try {
-                        const r = await fetch(u, {
-                            credentials: 'same-origin',
-                            headers: { 'accept': 'application/json' }
-                        });
-                        detailStatus = r.status;
-                        if (r.status === 200) {
-                            detailJson = await r.json();
-                            break;
-                        }
-                    } catch (e) {}
-                }
-
-                let slimDetail = null;
-                if (detailJson) {
-                    const dObj = detailJson.data || {};
-                    const dAttrs = dObj.attributes || {};
-                    slimDetail = {
-                        included: detailJson.included || [],
-                        data: {
-                            id: dObj.id,
-                            attributes: {
-                                publishOn: dAttrs.publishOn,
-                                title: dAttrs.title,
-                                sentiments: dAttrs.sentiments,
-                                rating: dAttrs.rating
-                            },
-                            relationships: dObj.relationships || {}
-                        }
-                    };
-                }
-
-                return Object.assign({}, c, {
-                    detailStatus: detailStatus,
-                    detail: slimDetail
-                });
-            });
-            return await Promise.all(tasks);
-        }, cards);
+        // 被反爬拦截：前两次抛错换会话重试；最后一次如实返回，方便诊断
+        if (info.blocked && (request.retryCount || 0) < 2) {
+            try { if (context.session && context.session.retire) context.session.retire(); } catch (e) {}
+            throw new Error('PX_BLOCKED');
+        }
 
         return {
-            schema: 'v4',
-            symbol: sym.toUpperCase(),
-            count: enriched.length,
-            items: enriched
+            schema: request.userData.schema,
+            symbol: request.userData.symbol,
+            order: request.userData.order,
+            title_en: request.userData.title_en,
+            date: request.userData.date,
+            author: request.userData.author,
+            blocked: info.blocked,
+            capturedV3: request.userData._capturedV3,
+            ssrSnippet: info.ssrSnippet,
+            headText: info.headText
         };
     }
     """
+
     pup_input = {
-        "startUrls": [{
-            "url": f"https://seekingalpha.com/symbol/{sa_sym}/analysis",
-            "userData": {"symbol": symbol},
-        }],
+        "startUrls": start_urls,
         "linkSelector": "",
+        "preNavigationHooks": pre_nav_hook,
         "pageFunction": page_fn,
-        "proxyConfiguration": proxy_cfg,
+        "proxyConfiguration": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
         "useChrome": True,
-        "maxPagesPerCrawl": 1,
+        "maxConcurrency": 4,
+        "maxPagesPerCrawl": 8,
         "maxRequestRetries": 2,
-        "pageLoadTimeoutSecs": 45,
+        "pageLoadTimeoutSecs": 35,
     }
+
     r_start = requests.post(
         f"https://api.apify.com/v2/acts/{PUPPETEER_ACTOR_ID}/runs",
         params={"token": token},
@@ -442,7 +518,7 @@ def run_puppeteer_v4_details(token, symbol, proxy_cfg):
     ds_id = rdata.get("defaultDatasetId")
     f_status = "RUNNING"
 
-    for _ in range(30):
+    for _ in range(50):  # 最多等 150 秒（含重试）
         time.sleep(3)
         rp = requests.get(
             f"https://api.apify.com/v2/actor-runs/{run_id}",
@@ -464,172 +540,153 @@ def run_puppeteer_v4_details(token, symbol, proxy_cfg):
         )
         if ri.status_code == 200:
             arr = ri.json()
-            if isinstance(arr, list) and arr and isinstance(arr[0], dict):
-                return arr[0], f"SUCCEEDED(run={run_id[:8]})"
-
-    err_tail = ""
-    try:
-        rlog = requests.get(
-            f"https://api.apify.com/v2/logs/{run_id}",
-            params={"token": token},
-            timeout=(4, 8),
-        )
-        if rlog.status_code == 200 and rlog.text:
-            lines = [ln.strip() for ln in rlog.text.splitlines() if "ERROR" in ln or "Error" in ln]
-            err_tail = (lines[-1] if lines else rlog.text[-160:]).strip()
-    except Exception:
-        pass
-    return None, f"状态={f_status}({err_tail[:140]})"
+            if isinstance(arr, list) and arr:
+                return arr, f"SUCCEEDED(run={str(run_id)[:8]}, 共{len(arr)}篇)"
+        return None, f"SUCCEEDED但数据集为空(run={str(run_id)[:8]})"
+    return None, f"状态={f_status}(run={str(run_id)[:8]})"
 
 
-def parse_v4_enriched_record(rec, symbol):
-    items = rec.get("items") or []
+def parse_dataset_array(arr, symbol, schema_ver):
+    if not isinstance(arr, list) or not arr:
+        return [], "空数组"
+    valid_rows = [
+        x for x in arr
+        if isinstance(x, dict)
+        and x.get("schema") == schema_ver
+        and str(x.get("symbol") or "").upper() == symbol
+    ]
+    if not valid_rows:
+        return [], f"非当前股票{schema_ver}记录"
+
+    valid_rows.sort(key=lambda r: int(r.get("order", 999)))
     out = []
-    statuses = []
-    first_detail_diag = ""
+    first_diag = ""
+    blocked_cnt = 0
 
-    for idx, it in enumerate(items):
-        if not isinstance(it, dict):
-            continue
-        title = (it.get("title") or "").strip()
-        if not title:
-            continue
-        detail = it.get("detail")
-        statuses.append(it.get("detailStatus"))
+    for idx, row in enumerate(valid_rows):
+        if row.get("blocked"):
+            blocked_cnt += 1
+        rk = extract_rating_from_single_article_v3(row.get("capturedV3"), symbol)
+        if not rk and row.get("ssrSnippet"):
+            rk = extract_rating_from_ssr_snippet(row.get("ssrSnippet"))
 
-        pub_iso = ""
-        if isinstance(detail, dict):
-            pub_iso = ((detail.get("data") or {}).get("attributes") or {}).get("publishOn") or ""
-        pub = format_pub_date(pub_iso or it.get("date") or "")
-        author = (it.get("author") or "Seeking Alpha Analyst").strip()
-
-        rk = extract_rating_from_single_article_v3(detail, symbol)
-
-        if idx == 0 and isinstance(detail, dict):
-            inc = detail.get("included") or []
-            inc_summary = [(x.get("type"), x.get("attributes")) for x in inc if "author" not in str(x.get("type"))]
-            rels_keys = list(((detail.get("data") or {}).get("relationships") or {}).keys())
-            first_detail_diag = f"首篇HTTP={it.get('detailStatus')}, rels={rels_keys}, inc={json.dumps(inc_summary, ensure_ascii=False)[:220]}"
+        if idx == 0:
+            has_cap = bool(row.get("capturedV3"))
+            ssr_snip = (row.get("ssrSnippet") or "")[:220]
+            head_txt = (row.get("headText") or "")[:120]
+            first_diag = (
+                f"首篇: 被拦截={bool(row.get('blocked'))}, 截获v3={has_cap}, "
+                f"ssr={ssr_snip}, 头部={head_txt}"
+            )
 
         out.append({
-            "title_en": title,
-            "date": pub,
-            "author": author,
+            "title_en": row.get("title_en") or "",
+            "date": row.get("date") or "",
+            "author": row.get("author") or "Seeking Alpha Analyst",
             "rating_key": rk,
         })
 
     ratings_preview = [x.get("rating_key") for x in out[:5]]
-    diag = f"详情HTTP状态={statuses[:5]}, 前5评级={ratings_preview}"
-    if not any(ratings_preview) and first_detail_diag:
-        diag += f" | {first_detail_diag}"
+    diag = f"前5评级={ratings_preview}, 被反爬拦截={blocked_cnt}/{len(valid_rows)}篇"
+    if not any(x.get("rating_key") for x in out):
+        diag += f" | {first_diag}"
     return out, diag
 
 
-@st.cache_data(ttl=21600)
-def load_seeking_alpha_feed(symbol, has_token, _schema=CACHE_SCHEMA_VER):
-    articles = []
-    debug_notes = []
-    token = get_apify_token() if has_token else ""
+class SARatingUnavailable(Exception):
+    """没抓到任何评级。抛异常可让 st.cache_data 不缓存这次失败结果。"""
+    pass
 
-    if token:
-        try:
-            r_hist = requests.get(
-                f"https://api.apify.com/v2/acts/{PUPPETEER_ACTOR_ID}/runs",
-                params={"token": token, "desc": "true", "limit": 10},
-                timeout=(4, 10),
-            )
-            if r_hist.status_code == 200:
-                for run_info in (r_hist.json().get("data") or {}).get("items") or []:
-                    ds_id = run_info.get("defaultDatasetId")
-                    started_at = run_info.get("startedAt")
-                    fresh = True
-                    if started_at:
-                        age_h = (pd.Timestamp.now("UTC") - pd.to_datetime(started_at, utc=True)).total_seconds() / 3600.0
-                        if age_h > 6:
-                            fresh = False
-                    if run_info.get("status") == "SUCCEEDED" and ds_id and fresh:
-                        rds = requests.get(
-                            f"https://api.apify.com/v2/datasets/{ds_id}/items",
-                            params={"token": token},
-                            timeout=(4, 10),
-                        )
-                        if rds.status_code == 200:
-                            arr = rds.json()
-                            if isinstance(arr, list) and arr and isinstance(arr[0], dict):
-                                rec = arr[0]
-                                if rec.get("schema") == "v4" and str(rec.get("symbol") or "").upper() == symbol:
-                                    cand, diag = parse_v4_enriched_record(rec, symbol)
-                                    if cand:
-                                        articles = cand
-                                        debug_notes.append(f"命中v4缓存({ds_id[:8]}) | {diag}")
-                                        break
-        except Exception:
-            pass
 
-        if not articles:
-            proxy_cfg = {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]}
-            try:
-                rec, note = run_puppeteer_v4_details(token, symbol, proxy_cfg)
-                debug_notes.append(f"住宅代理v4:{note}")
-                if rec:
-                    cand, diag = parse_v4_enriched_record(rec, symbol)
-                    debug_notes.append(diag)
-                    if cand:
-                        articles = cand
-            except Exception as e:
-                debug_notes.append(f"v4异常:{str(e)[:60]}")
+@st.cache_data(ttl=21600, show_spinner=False)
+def _load_sa_rated(symbol, schema_ver):
+    """只有成功拿到至少一个评级才会被缓存 6 小时；否则抛 SARatingUnavailable。"""
+    token = get_apify_token()
+    if not token:
+        raise SARatingUnavailable("未配置APIFY_API_TOKEN")
+    notes = []
 
-    if not articles:
-        sa_xml_url = f"https://seekingalpha.com/api/sa/combined/{symbol}.xml"
-        try:
-            rx = requests.get(
-                sa_xml_url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    # 1. 复用最近 6 小时内、同股票、且确实带评级的数据集
+    try:
+        r_hist = requests.get(
+            f"https://api.apify.com/v2/acts/{PUPPETEER_ACTOR_ID}/runs",
+            params={"token": token, "desc": "true", "limit": 10},
+            timeout=(4, 10),
+        )
+        if r_hist.status_code == 200:
+            for run_info in (r_hist.json().get("data") or {}).get("items") or []:
+                ds_id = run_info.get("defaultDatasetId")
+                started_at = run_info.get("startedAt")
+                fresh = True
+                if started_at:
+                    age_h = (
+                        pd.Timestamp.now("UTC") - pd.to_datetime(started_at, utc=True)
+                    ).total_seconds() / 3600.0
+                    if age_h > 6:
+                        fresh = False
+                if run_info.get("status") == "SUCCEEDED" and ds_id and fresh:
+                    rds = requests.get(
+                        f"https://api.apify.com/v2/datasets/{ds_id}/items",
+                        params={"token": token},
+                        timeout=(4, 10),
                     )
-                },
-                timeout=(3, 8),
-            )
-            if rx.status_code == 200 and rx.content:
-                root = ET.fromstring(rx.content)
-                ns = {"sa": "https://seekingalpha.com/api/1.0"}
-                for item in root.findall("./channel/item"):
-                    orig_link = (item.findtext("link") or "").strip()
-                    if "/article/" not in orig_link:
-                        continue
-                    title = (item.findtext("title") or "").strip()
-                    if not title or title.lower().startswith("wall street breakfast"):
-                        continue
-                    pub = format_pub_date(item.findtext("pubDate") or "")
-                    author = (item.findtext("sa:author_name", namespaces=ns) or "").strip()
-                    articles.append({
-                        "title_en": title,
-                        "date": pub,
-                        "author": author or "Seeking Alpha Analyst",
-                        "rating_key": None,
-                    })
-                    if len(articles) >= 10:
-                        break
-                debug_notes.append("回退官方XML流")
-        except Exception:
-            pass
+                    if rds.status_code == 200:
+                        cand, diag = parse_dataset_array(rds.json(), symbol, schema_ver)
+                        if cand and any(a.get("rating_key") for a in cand):
+                            return finalize_articles(cand), f"命中{schema_ver}缓存({ds_id[:8]}) | {diag}"
+    except Exception:
+        pass
 
-    if articles:
-        zh_titles = translate_titles_to_zh([a["title_en"] for a in articles])
-        for art, zh in zip(articles, zh_titles):
-            art["title_zh"] = zh
-            rk = art.get("rating_key")
-            if rk and rk in RATING_MAP:
-                label, css_cls = RATING_MAP[rk]
-                art["rating_label"] = label
-                art["rating_cls"] = css_cls
-            else:
-                art["rating_label"] = None
-                art["rating_cls"] = None
+    # 2. 启动新的抓取
+    try:
+        arr, note = run_puppeteer_real_pages(token, symbol, schema_ver)
+        notes.append(f"真实页面{schema_ver}:{note}")
+        if arr:
+            cand, diag = parse_dataset_array(arr, symbol, schema_ver)
+            notes.append(diag)
+            if cand and any(a.get("rating_key") for a in cand):
+                return finalize_articles(cand), " | ".join(notes)
+    except Exception as e:
+        notes.append(f"抓取异常:{str(e)[:80]}")
 
-    return articles, " | ".join(debug_notes)
+    raise SARatingUnavailable(" | ".join(notes) or "未获取到评级")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _load_sa_xml_only(symbol):
+    """保底通道：仅文章列表、无评级，只缓存 15 分钟。"""
+    try:
+        return finalize_articles(fetch_sa_xml_articles(symbol, 10))
+    except Exception:
+        return []
+
+
+@st.cache_resource
+def _sa_fail_registry():
+    """记录各股票最近一次评级抓取失败的时间，避免每次页面刷新都重启 Apify。"""
+    return {}
+
+
+def load_seeking_alpha_feed(symbol, has_token):
+    reg = _sa_fail_registry()
+    note = ""
+    if has_token:
+        key = f"{CACHE_SCHEMA_VER}:{symbol}"
+        last = reg.get(key)
+        if not last or time.time() - last[0] > SA_FAIL_RETRY_SECS:
+            try:
+                return _load_sa_rated(symbol, CACHE_SCHEMA_VER)
+            except SARatingUnavailable as e:
+                reg[key] = (time.time(), str(e))
+            except Exception as e:
+                reg[key] = (time.time(), f"异常:{str(e)[:80]}")
+        fail_ts, fail_msg = reg[key]
+        wait_min = max(0, int((SA_FAIL_RETRY_SECS - (time.time() - fail_ts)) / 60))
+        note = f"评级抓取失败（约{wait_min}分钟后自动重试）: {fail_msg} | "
+
+    articles = _load_sa_xml_only(symbol)
+    note += "回退官方XML流（无评级）" if articles else "官方XML流也未取到文章"
+    return articles, note
 
 
 @st.cache_data(ttl=86400)
@@ -992,7 +1049,7 @@ with row1_right:
 
         if ticker:
             spinner_msg = (
-                f"正在从 Seeking Alpha 逐篇读取 {ticker} 详情评级（约 20~35 秒，之后 6 小时秒开）..."
+                f"正在打开 {ticker} 最新 8 篇分析原文同步官网评级（首次约 30~90 秒，成功后 6 小时秒开）..."
                 if has_apify else "正在拉取 Seeking Alpha 分析列表..."
             )
             with st.spinner(spinner_msg):
@@ -1056,7 +1113,9 @@ if detail_meta is not None:
                 height=200,
                 use_container_width=True,
             )
-            if sa_debug_msg:
-                st.caption(f"📡 Seeking Alpha 数据通道状态：{sa_debug_msg}")
+
+# 诊断信息：始终显示（个股 / ETF / PE 加载失败时都能看到）
+if sa_debug_msg:
+    st.caption(f"📡 Seeking Alpha 数据通道状态：{sa_debug_msg}")
 
 st.caption("数据来源：Yahoo Finance、SEC EDGAR、Seeking Alpha，仅供参考，不构成投资建议。")
