@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 import requests
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
+import json
 import re
 import time
 import html
@@ -19,6 +20,7 @@ SA_REFERRAL_URL = (
 )
 
 PUPPETEER_ACTOR_ID = "apify~puppeteer-scraper"
+CACHE_SCHEMA_VER = "v2"
 
 st.set_page_config(page_title="美股估值看板", layout="wide")
 
@@ -201,13 +203,13 @@ SA_SENTIMENT_ID_MAP = {
 }
 
 
-def normalize_rating_str(raw_rating):
-    if raw_rating is None:
+def normalize_rating_str(raw_rating, allow_numeric=False):
+    if raw_rating is None or isinstance(raw_rating, bool):
         return None
     s = str(raw_rating).strip().lower()
     if not s or s in ("none", "n/a", "null", "unknown", "no rating"):
         return None
-    if s in SA_SENTIMENT_ID_MAP:
+    if allow_numeric and s in SA_SENTIMENT_ID_MAP:
         return SA_SENTIMENT_ID_MAP[s]
     k_space = s.replace("-", " ").replace("_", " ")
     k_under = k_space.replace(" ", "_")
@@ -218,6 +220,57 @@ def normalize_rating_str(raw_rating):
     return None
 
 
+def scan_rating_in_obj(obj):
+    """递归扫描任意 JSON 对象中的所有字段，自动识别评级枚举词或 sentimentId"""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower()
+            is_num_rating_field = kl in ("sentimentid", "sentiment_id", "ratingid", "rating_id")
+            if isinstance(v, (str, int, float)):
+                rk = normalize_rating_str(v, allow_numeric=is_num_rating_field)
+                if rk:
+                    return rk
+            elif isinstance(v, (dict, list)):
+                rk = scan_rating_in_obj(v)
+                if rk:
+                    return rk
+    elif isinstance(obj, list):
+        for elem in obj:
+            rk = scan_rating_in_obj(elem)
+            if rk:
+                return rk
+    return None
+
+
+def inspect_v3_structure(payload):
+    """生成一行精简诊断摘要，看清 SA 返回的真实 JSON 字段名"""
+    if not isinstance(payload, dict):
+        return f"v3非dict({type(payload).__name__})"
+    d_list = payload.get("data") or []
+    inc_list = payload.get("included") or []
+    inc_types = {}
+    sent_sample = None
+    for it in inc_list:
+        t = str(it.get("type"))
+        inc_types[t] = inc_types.get(t, 0) + 1
+        if ("sent" in t.lower() or "rat" in t.lower()) and sent_sample is None:
+            sent_sample = it
+    art_rels = []
+    art_rating_fields = {}
+    if d_list and isinstance(d_list[0], dict):
+        a0 = d_list[0]
+        art_rels = list((a0.get("relationships") or {}).keys())
+        attrs0 = a0.get("attributes") or {}
+        for k, v in attrs0.items():
+            if any(w in k.lower() for w in ("sent", "rat", "bull", "bear", "quant", "sell", "buy")):
+                art_rating_fields[k] = v
+    return (
+        f"inc类型={inc_types}, 文章rels={art_rels}, "
+        f"文章评级相关属性={art_rating_fields}, "
+        f"首个sentiment样例={json.dumps(sent_sample, ensure_ascii=False)[:180] if sent_sample else '无'}"
+    )
+
+
 def parse_v3_json_payload(payload, symbol):
     out = []
     if not isinstance(payload, dict):
@@ -226,13 +279,15 @@ def parse_v3_json_payload(payload, symbol):
     included = payload.get("included") or []
     sa_sym_up = symbol.upper().replace(".", "-")
 
+    inc_by_key = {}
     inc_authors = {}
     tags_by_id = {}
     target_tag_id = None
 
     for item in included:
-        itype = item.get("type")
-        iid = str(item.get("id"))
+        itype = str(item.get("type") or "")
+        iid = str(item.get("id") or "")
+        inc_by_key[(itype, iid)] = item
         attrs = item.get("attributes") or {}
         if itype == "author":
             inc_authors[iid] = (attrs.get("nick") or "Seeking Alpha Analyst").strip()
@@ -245,15 +300,14 @@ def parse_v3_json_payload(payload, symbol):
 
     sent_map = {}
     for item in included:
-        if item.get("type") == "sentiment":
-            sid = str(item.get("id"))
+        itype = str(item.get("type") or "")
+        if "sentiment" in itype.lower() or "rating" in itype.lower():
+            sid = str(item.get("id") or "")
             attrs = item.get("attributes") or {}
-            rk = None
-            for fld in ("type", "rating", "label", "slug", "sentimentId", "id"):
-                rk = normalize_rating_str(attrs.get(fld))
-                if rk:
-                    break
+            rk = scan_rating_in_obj(attrs)
             rels = item.get("relationships") or {}
+            if not rk:
+                rk = scan_rating_in_obj(rels)
             st_id = str((rels.get("tag", {}).get("data") or {}).get("id") or "")
             if rk:
                 sent_map[sid] = (rk, st_id)
@@ -263,10 +317,7 @@ def parse_v3_json_payload(payload, symbol):
             continue
         attrs = art.get("attributes") or {}
         title = (attrs.get("title") or "").strip()
-        if not title:
-            continue
-        # 剔除 Wall Street Breakfast 播客快讯，只保留个股深度分析
-        if title.lower().startswith("wall street breakfast"):
+        if not title or title.lower().startswith("wall street breakfast"):
             continue
         pub = format_pub_date(attrs.get("publishOn") or "")
 
@@ -276,22 +327,43 @@ def parse_v3_json_payload(payload, symbol):
 
         rating_key = None
         fallback_rk = None
-        sent_refs = (rels.get("sentiments", {}).get("data"))
-        if isinstance(sent_refs, dict):
-            sent_refs = [sent_refs]
-        if sent_refs:
-            for s_ref in sent_refs:
-                sid = str(s_ref.get("id") or "")
-                if sid in sent_map:
-                    rk, st_id = sent_map[sid]
-                    slug, name = tags_by_id.get(st_id, ("", ""))
-                    if (target_tag_id and st_id == target_tag_id) or slug in (symbol, sa_sym_up) or name in (symbol, sa_sym_up):
+
+        # 1. 从 relationships.sentiments 查找
+        for rel_name, rel_obj in rels.items():
+            if "sent" in rel_name.lower() or "rat" in rel_name.lower():
+                refs = (rel_obj or {}).get("data")
+                if isinstance(refs, dict):
+                    refs = [refs]
+                if isinstance(refs, list):
+                    for s_ref in refs:
+                        sid = str(s_ref.get("id") or "")
+                        stype = str(s_ref.get("type") or "")
+                        if sid in sent_map:
+                            rk, st_id = sent_map[sid]
+                            slug, name = tags_by_id.get(st_id, ("", ""))
+                            if (target_tag_id and st_id == target_tag_id) or slug in (symbol, sa_sym_up) or name in (symbol, sa_sym_up):
+                                rating_key = rk
+                                break
+                            if fallback_rk is None:
+                                fallback_rk = rk
+                        elif (stype, sid) in inc_by_key:
+                            rk = scan_rating_in_obj(inc_by_key[(stype, sid)].get("attributes") or {})
+                            if rk and fallback_rk is None:
+                                fallback_rk = rk
+            if rating_key:
+                break
+
+        if not rating_key:
+            rating_key = fallback_rk
+
+        # 2. 如果文章 attributes 自身直接带有评级字段，扫描提取
+        if not rating_key:
+            for k, v in attrs.items():
+                if any(w in k.lower() for w in ("sent", "rat")):
+                    rk = scan_rating_in_obj({k: v})
+                    if rk:
                         rating_key = rk
                         break
-                    if fallback_rk is None:
-                        fallback_rk = rk
-            if rating_key is None:
-                rating_key = fallback_rk
 
         out.append({
             "title_en": title,
@@ -353,57 +425,76 @@ def get_apify_token():
 
 def run_puppeteer_once(token, symbol, proxy_cfg):
     sa_sym = symbol.lower().replace(".", "-")
+    # 同时拦截网页原生发出的 /articles API 数据包 + 等待评级徽章渲染后提取 DOM 文本
     page_fn = """
     async function pageFunction(context) {
         const { page, request } = context;
         const sym = request.userData.symbol || 'AAPL';
         const sLow = sym.toLowerCase().replace('.', '-');
-        await new Promise(r => setTimeout(r, 2000));
 
-        // 方式1：直接在同源浏览器内拉取 Seeking Alpha v3 完整评级接口
-        let v3Res = { status: 0, body: null };
+        // 稍微向下滚动触发懒加载评级组件渲染，并等待 3.5 秒
+        try {
+            await page.evaluate(() => window.scrollBy(0, 500));
+        } catch (e) {}
+        await new Promise(r => setTimeout(r, 3500));
+
+        // 方式1：请求不带多余限制参数的默认 /articles 接口（与 SA 前端默认请求一致）以及显式带 sentiments 的接口
+        let v3Res = { status: 0, body: null, urlUsed: '' };
         try {
             v3Res = await page.evaluate(async (s) => {
-                const u = `/api/v3/symbols/${s}/articles?filter[category]=latest-articles&include=author,sentiments,sentiments.tag,primaryTickers&page[size]=14`;
-                const r = await fetch(u, { credentials: 'same-origin', headers: { 'accept': 'application/json' } });
-                const txt = await r.text();
-                let jb = null;
-                try { jb = JSON.parse(txt); } catch (e) {}
-                return { status: r.status, body: jb };
+                const urls = [
+                    `/api/v3/symbols/${s}/articles?filter[category]=latest-articles&page[size]=14&include=author,primaryTickers,secondaryTickers,sentiments,sentiments.tag`,
+                    `/api/v3/symbols/${s}/articles?page[size]=14`
+                ];
+                for (const u of urls) {
+                    const r = await fetch(u, { credentials: 'same-origin', headers: { 'accept': 'application/json' } });
+                    if (r.status === 200) {
+                        const jb = await r.json();
+                        if (jb && jb.data && jb.data.length > 0) {
+                            return { status: 200, body: jb, urlUsed: u };
+                        }
+                    }
+                }
+                return { status: -2, body: null, urlUsed: '' };
             }, sLow);
         } catch (err) {
             v3Res = { status: -1, err: String(err) };
         }
 
-        // 方式2：同时从渲染好的网页 DOM 卡片提取可见评级标签作为双保险
+        // 方式2：扫描页面上所有文章卡片元素及评级胶囊（兼容 button / span / div / data-test-id）
         let domCards = [];
         try {
             domCards = await page.evaluate(() => {
-                const cards = Array.from(document.querySelectorAll('article'));
+                const ratingSet = new Set(['strong buy', 'buy', 'hold', 'sell', 'strong sell']);
+                const cards = Array.from(document.querySelectorAll('article, [data-test-id="post-list-item"]'));
                 return cards.slice(0, 14).map(el => {
-                    const tEl = el.querySelector('a[data-test-id="post-list-item-title"], h3 a');
+                    const tEl = el.querySelector('a[data-test-id="post-list-item-title"], h3 a, a[href*="/article/"]');
                     const aEl = el.querySelector('a[data-test-id="post-list-author"], a[href*="/author/"]');
                     const timeEl = el.querySelector('span[data-test-id="post-list-date"], time');
                     let foundRating = null;
-                    const spans = Array.from(el.querySelectorAll('span, div'));
-                    for (const sp of spans) {
-                        const tx = (sp.textContent || '').trim().toLowerCase();
-                        if (['strong buy', 'buy', 'hold', 'sell', 'strong sell'].includes(tx)) {
-                            foundRating = tx;
-                            break;
+                    const nodes = Array.from(el.querySelectorAll('[data-test-id*="rating"], button, span, div'));
+                    for (const nd of nodes) {
+                        if (nd.children.length === 0) {
+                            const tx = (nd.textContent || '').trim().toLowerCase();
+                            if (ratingSet.has(tx)) {
+                                foundRating = tx;
+                                break;
+                            }
                         }
                     }
                     return {
                         title: tEl ? tEl.textContent.trim() : '',
                         author: aEl ? aEl.textContent.trim() : '',
                         date: timeEl ? (timeEl.getAttribute('datetime') || timeEl.textContent.trim()) : '',
-                        rating: foundRating
+                        rating: foundRating,
+                        cardTextSample: (el.innerText || '').replace(/\\s+/g, ' ').slice(0, 140)
                     };
                 }).filter(x => x.title);
             });
         } catch (e) {}
 
         return {
+            schema: 'v2',
             symbol: sym.toUpperCase(),
             pageTitle: await page.title(),
             status: v3Res.status,
@@ -432,14 +523,14 @@ def run_puppeteer_once(token, symbol, proxy_cfg):
         timeout=(5, 15),
     )
     if r_start.status_code not in (200, 201):
-        return None, f"启动HTTP {r_start.status_code}: {r_start.text[:100]}"
+        return None, f"启动HTTP {r_start.status_code}"
 
     rdata = r_start.json().get("data") or {}
     run_id = rdata.get("id")
     ds_id = rdata.get("defaultDatasetId")
     f_status = "RUNNING"
 
-    for _ in range(30):  # 最多等 90 秒
+    for _ in range(30):
         time.sleep(3)
         rp = requests.get(
             f"https://api.apify.com/v2/actor-runs/{run_id}",
@@ -463,32 +554,41 @@ def run_puppeteer_once(token, symbol, proxy_cfg):
             arr = ri.json()
             if isinstance(arr, list) and arr and isinstance(arr[0], dict):
                 return arr[0], f"SUCCEEDED(run={run_id[:8]})"
-        return None, f"SUCCEEDED但数据集为空(run={run_id[:8]})"
+    return None, f"状态={f_status}"
 
-    # 若失败，拉取最后 300 字符运行日志看具体报错原因
-    err_tail = ""
-    try:
-        rlog = requests.get(
-            f"https://api.apify.com/v2/logs/{run_id}",
-            params={"token": token},
-            timeout=(4, 8),
-        )
-        if rlog.status_code == 200 and rlog.text:
-            lines = [ln.strip() for ln in rlog.text.splitlines() if "ERROR" in ln or "Error" in ln or "Blocked" in ln]
-            err_tail = (lines[-1] if lines else rlog.text[-180:]).strip()
-    except Exception:
-        pass
-    return None, f"状态={f_status}({err_tail[:140]})"
+
+def merge_and_diagnose(rec, symbol):
+    v3_body = rec.get("v3_body")
+    dom_cards = rec.get("dom_cards") or []
+    cand = parse_v3_json_payload(v3_body, symbol)
+    dom_cand = parse_dom_cards(dom_cards)
+
+    if cand and dom_cand:
+        dom_map = {d["title_en"]: d["rating_key"] for d in dom_cand if d.get("rating_key")}
+        for c in cand:
+            if not c.get("rating_key") and c["title_en"] in dom_map:
+                c["rating_key"] = dom_map[c["title_en"]]
+
+    final_cand = cand if cand else dom_cand
+    ratings_preview = [c.get("rating_key") for c in final_cand[:5]]
+
+    diag = f"前5评级={ratings_preview}"
+    # 如果仍然全是 None，把刚才抓到的真实 JSON 字段结构摘要打印出来，一眼看穿
+    if not any(ratings_preview):
+        v3_diag = inspect_v3_structure(v3_body)
+        dom_sample = dom_cards[0].get("cardTextSample", "") if dom_cards else "无DOM卡片"
+        diag += f" | 结构诊断: {v3_diag} | 首卡片文本={dom_sample}"
+    return final_cand, diag
 
 
 @st.cache_data(ttl=21600)
-def load_seeking_alpha_feed(symbol, has_token):
+def load_seeking_alpha_feed(symbol, has_token, _schema=CACHE_SCHEMA_VER):
     articles = []
     debug_notes = []
     token = get_apify_token() if has_token else ""
 
     if token:
-        # 1. 先秒查最近 6 小时内已跑成功的同股票缓存结果
+        # 1. 先检查最近 6 小时内已跑成功的同股票数据集（可直接复用刚才跑成功的 u7M1oQoF，不用重新跑！）
         try:
             r_hist = requests.get(
                 f"https://api.apify.com/v2/acts/{PUPPETEER_ACTOR_ID}/runs",
@@ -515,45 +615,34 @@ def load_seeking_alpha_feed(symbol, has_token):
                             if isinstance(arr, list) and arr and isinstance(arr[0], dict):
                                 rec = arr[0]
                                 if str(rec.get("symbol") or "").upper() == symbol:
-                                    cand = parse_v3_json_payload(rec.get("v3_body"), symbol)
-                                    if not cand:
-                                        cand = parse_dom_cards(rec.get("dom_cards"))
-                                    if cand:
-                                        articles = cand
-                                        debug_notes.append(f"命中6小时缓存! 前5评级={[c.get('rating_key') for c in cand[:5]]}")
+                                    final_cand, diag = merge_and_diagnose(rec, symbol)
+                                    # 若旧缓存是 v1 且没抓到评级，允许再跑一次带滚动的 v2；若已是 v2 或已有评级则直接秒用
+                                    if final_cand and (any(c.get("rating_key") for c in final_cand) or rec.get("schema") == "v2"):
+                                        articles = final_cand
+                                        debug_notes.append(f"命中缓存({ds_id[:8]}) | {diag}")
                                         break
-        except Exception:
-            pass
+                                    elif final_cand:
+                                        # 先记录下来旧缓存的结构诊断信息
+                                        debug_notes.append(f"旧缓存诊断({ds_id[:8]}): {diag}")
+                                        break
+        except Exception as e:
+            debug_notes.append(f"读缓存异常:{str(e)[:50]}")
 
-        # 2. 优先使用 RESIDENTIAL 住宅代理（过 Seeking Alpha 防火墙成功率最高），若账号不支持住宅代理自动降级普通代理
+        # 2. 若还没有带评级的结果，用 v2 脚本跑一次住宅代理
         if not articles:
-            for proxy_label, proxy_cfg in [
-                ("住宅代理RESIDENTIAL", {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]}),
-                ("标准代理AUTO", {"useApifyProxy": True}),
-            ]:
-                try:
-                    rec, note = run_puppeteer_once(token, symbol, proxy_cfg)
-                    debug_notes.append(f"{proxy_label}:{note}")
-                    if rec:
-                        cand = parse_v3_json_payload(rec.get("v3_body"), symbol)
-                        dom_cand = parse_dom_cards(rec.get("dom_cards"))
-                        # 如果 v3 某些文章没匹配到评级而 DOM 卡片抓到了，互相补全
-                        if cand and dom_cand:
-                            dom_map = {d["title_en"]: d["rating_key"] for d in dom_cand if d.get("rating_key")}
-                            for c in cand:
-                                if not c.get("rating_key") and c["title_en"] in dom_map:
-                                    c["rating_key"] = dom_map[c["title_en"]]
-                        final_cand = cand if cand else dom_cand
-                        if final_cand:
-                            articles = final_cand
-                            debug_notes.append(f"提取成功! 前5评级={[c.get('rating_key') for c in final_cand[:5]]}")
-                            break
-                        else:
-                            debug_notes.append(f"页面标题={str(rec.get('pageTitle'))[:35]}, v3状态={rec.get('status')}")
-                except Exception as e:
-                    debug_notes.append(f"{proxy_label}异常:{str(e)[:60]}")
+            proxy_cfg = {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]}
+            try:
+                rec, note = run_puppeteer_once(token, symbol, proxy_cfg)
+                debug_notes.append(f"住宅代理v2:{note}")
+                if rec:
+                    final_cand, diag = merge_and_diagnose(rec, symbol)
+                    if final_cand:
+                        articles = final_cand
+                        debug_notes.append(diag)
+            except Exception as e:
+                debug_notes.append(f"住宅代理异常:{str(e)[:60]}")
 
-    # 保底通道：官方 XML 分析流（同时剔除 Wall Street Breakfast 快讯）
+    # 保底通道
     if not articles:
         sa_xml_url = f"https://seekingalpha.com/api/sa/combined/{symbol}.xml"
         try:
