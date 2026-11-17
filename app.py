@@ -9,7 +9,6 @@ HEADERS = {"User-Agent": "PE-Website aihuaxiawenhua@gmail.com"}
 
 st.set_page_config(page_title="美股估值看板", layout="wide")
 
-# 修复顶部遮挡 + 压缩卡片内部间距，确保四宫格完整装进一屏不溢出
 st.markdown("""
     <style>
     .block-container {
@@ -19,14 +18,12 @@ st.markdown("""
         padding-right: 2rem !important;
         max-width: 100% !important;
     }
-    /* 缩小指标数字和标题，节省垂直空间 */
     [data-testid="stMetricValue"] {
         font-size: 1.35rem !important;
     }
     [data-testid="stMetricLabel"] {
         font-size: 0.8rem !important;
     }
-    /* 右上/左下/右下的占位框高度与左上角卡片对齐 */
     .placeholder-box {
         height: 255px;
         display: flex;
@@ -42,14 +39,13 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# 顶部导航与全局搜索栏（垂直居中对齐）
 head_col1, head_col2, head_col3 = st.columns([2.5, 1, 1], vertical_alignment="center")
 with head_col1:
     st.markdown("### 📊 美股核心数据看板")
 with head_col2:
     ticker = st.text_input(
         "股票代码", "AAPL",
-        placeholder="输入代码如 AAPL、MSFT",
+        placeholder="输入代码如 AAPL、SPY、QQQ",
         label_visibility="collapsed"
     ).upper().strip()
 with head_col3:
@@ -61,7 +57,6 @@ with head_col3:
 
 
 def to_ns(s):
-    """兼容整列(Series/Index)和单个日期(Timestamp)，统一转为纳秒级时间精度"""
     dt = pd.to_datetime(s)
     if isinstance(dt, pd.Timestamp):
         return dt.as_unit("ns")
@@ -69,19 +64,18 @@ def to_ns(s):
 
 
 @st.cache_data(ttl=86400)
-def get_cik(symbol):
+def get_cik_map():
     r = requests.get("https://www.sec.gov/files/company_tickers.json",
                      headers=HEADERS, timeout=30)
     r.raise_for_status()
-    for item in r.json().values():
-        if item["ticker"].upper() == symbol:
-            return int(item["cik_str"])
-    return None
+    return {item["ticker"].upper(): int(item["cik_str"]) for item in r.json().values()}
 
 
 @st.cache_data(ttl=86400)
 def get_sec_facts(symbol):
-    cik = get_cik(symbol)
+    cik_map = get_cik_map()
+    # 兼容 BRK.B -> BRK-B 格式
+    cik = cik_map.get(symbol) or cik_map.get(symbol.replace(".", "-"))
     if cik is None:
         return None
     url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
@@ -197,7 +191,8 @@ def build_ttm_eps(facts, splits_series):
 
 
 @st.cache_data(ttl=86400)
-def load_pe(symbol, years):
+def load_stock_pe(symbol, years):
+    """个股历史 PE 计算（SEC + Yahoo）"""
     facts = get_sec_facts(symbol)
     if not facts:
         return None, None
@@ -245,22 +240,130 @@ def load_pe(symbol, years):
     return df, qdf
 
 
+# 常见主流 ETF 兜底重仓股权重（防止 yfinance 偶尔未返回 holdings）
+FALLBACK_HOLDINGS = {
+    "SPY": [("AAPL", 0.07), ("MSFT", 0.065), ("NVDA", 0.06), ("AMZN", 0.038), ("META", 0.025), ("GOOGL", 0.04), ("BRK-B", 0.018), ("AVGO", 0.018), ("LLY", 0.015), ("JPM", 0.014)],
+    "VOO": [("AAPL", 0.07), ("MSFT", 0.065), ("NVDA", 0.06), ("AMZN", 0.038), ("META", 0.025), ("GOOGL", 0.04), ("BRK-B", 0.018), ("AVGO", 0.018), ("LLY", 0.015), ("JPM", 0.014)],
+    "QQQ": [("AAPL", 0.088), ("MSFT", 0.082), ("NVDA", 0.078), ("AMZN", 0.052), ("AVGO", 0.045), ("META", 0.045), ("TSLA", 0.035), ("GOOGL", 0.052), ("COST", 0.026), ("NFLX", 0.022)],
+    "DIA": [("UNH", 0.08), ("GS", 0.075), ("MSFT", 0.062), ("HD", 0.058), ("CAT", 0.052), ("AMGN", 0.046), ("V", 0.044), ("CRM", 0.042), ("MCD", 0.042), ("AXP", 0.04)],
+}
+
+
+@st.cache_data(ttl=86400)
+def load_etf_pe(symbol, years):
+    """
+    ETF 历史 PE 估算：
+    1. 从 Yahoo Finance 获取 ETF 当前官方 trailingPE 及前十大重仓股权重
+    2. 计算核心重仓股组合的加权盈利率 (E/P = 1/PE) 历史序列
+    3. 按当前 ETF 官方真实 PE 对齐校准，还原出连续历史走势
+    """
+    t = yf.Ticker(symbol)
+    info = {}
+    try:
+        info = t.info or {}
+    except Exception:
+        pass
+
+    quote_type = info.get("quoteType", "")
+    official_pe = info.get("trailingPE")
+
+    # 提取前十大重仓股列表 [(symbol, weight), ...]
+    holdings = []
+    try:
+        fd = t.funds_data
+        if fd is not None and fd.top_holdings is not None and not fd.top_holdings.empty:
+            th = fd.top_holdings
+            for h_sym, row in th.iterrows():
+                w = float(row.get("Holding Percent", 0))
+                if h_sym and w > 0:
+                    holdings.append((str(h_sym).upper(), w))
+    except Exception:
+        pass
+
+    if not holdings and symbol in FALLBACK_HOLDINGS:
+        holdings = FALLBACK_HOLDINGS[symbol]
+
+    if not holdings:
+        return None, None
+
+    # 计算各重仓股的历史盈利率 (E/P = ttm / close)，比直接加权 PE 更科学（不怕单只股票微利导致 PE 暴涨失真）
+    ep_frames = []
+    used_holdings = []
+    for h_sym, weight in holdings[:10]:
+        sub_df, _ = load_stock_pe(h_sym, years)
+        if sub_df is not None and not sub_df.empty:
+            sub = sub_df[["date", "close", "ttm"]].dropna().copy()
+            if not sub.empty:
+                sub["ep"] = sub["ttm"] / sub["close"]
+                sub = sub.set_index("date")[["ep"]].rename(columns={"ep": h_sym})
+                ep_frames.append((h_sym, weight, sub))
+                used_holdings.append({"成分股": h_sym, "权重占比": f"{weight * 100:.2f}%"})
+
+    if not ep_frames:
+        return None, None
+
+    # 对齐所有成分股交易日并按有效权重每日加权平均 E/P
+    merged = pd.concat([f[2] for f in ep_frames], axis=1).sort_index().ffill()
+    weights = pd.Series({f[0]: f[1] for f in ep_frames})
+
+    valid_mask = merged.notna()
+    weighted_ep = merged.multiply(weights, axis=1).sum(axis=1)
+    active_weight = valid_mask.multiply(weights, axis=1).sum(axis=1)
+
+    basket_ep = (weighted_ep / active_weight).where(active_weight > 0)
+    basket_pe = (1.0 / basket_ep).where(basket_ep > 0)
+
+    res_df = pd.DataFrame({"date": basket_pe.index, "pe": basket_pe.values}).dropna()
+    if res_df.empty:
+        return None, None
+
+    # 用 Yahoo 官方最新 ETF 整体 trailingPE 做水平校准（消除前十大重仓与全样本的固定估值差）
+    if official_pe and official_pe > 0:
+        scale = float(official_pe) / res_df["pe"].iloc[-1]
+        # 限制校准系数在合理区间
+        if 0.4 <= scale <= 2.5:
+            res_df["pe"] = res_df["pe"] * scale
+
+    meta = {
+        "is_etf": True,
+        "official_pe": official_pe,
+        "holdings_df": pd.DataFrame(used_holdings),
+    }
+    return res_df.reset_index(drop=True), meta
+
+
+def load_any_pe(symbol, years):
+    """先查 SEC 个股，若不在 SEC 名单中则自动切换为 ETF 重仓拟合模式"""
+    df, qdf = load_stock_pe(symbol, years)
+    if df is not None and not df["pe"].dropna().empty:
+        return df, {"is_etf": False, "qdf": qdf}
+
+    etf_df, etf_meta = load_etf_pe(symbol, years)
+    if etf_df is not None and not etf_df["pe"].dropna().empty:
+        return etf_df, etf_meta
+
+    return None, None
+
+
 # ==================== 2x2 四宫格主体布局 ====================
 row1_left, row1_right = st.columns(2, gap="small")
 row2_left, row2_right = st.columns(2, gap="small")
 
-qdf_detail = None
+detail_meta = None
 
 # 【左上角】：历史市盈率走势模块
 with row1_left:
     with st.container(border=True):
-        st.markdown(f"**📈 {ticker} 历史市盈率 (PE-TTM)**")
         if ticker:
-            with st.spinner("加载数据中..."):
-                df, qdf_detail = load_pe(ticker, years)
+            with st.spinner(f"正在加载 {ticker} 数据（ETF 首次计算需拉取成分股约 15~30 秒）..."):
+                df, detail_meta = load_any_pe(ticker, years)
+
+            is_etf = bool(detail_meta and detail_meta.get("is_etf"))
+            tag = "ETF 重仓拟合" if is_etf else "PE-TTM"
+            st.markdown(f"**📈 {ticker} 历史市盈率 ({tag})**")
 
             if df is None or df["pe"].dropna().empty:
-                st.error("未找到有效正向 PE 数据，请检查股票代码或邮箱配置。")
+                st.error("未找到有效 PE 数据，请检查代码（如 AAPL、SPY、QQQ）或确认邮箱已修改。")
             else:
                 valid = df.dropna(subset=["pe"])
                 median = valid["pe"].median()
@@ -326,21 +429,26 @@ with row2_right:
             </div>
         """, unsafe_allow_html=True)
 
-# 底部折叠明细与说明（不占用主屏幕四宫格高度）
-if qdf_detail is not None:
-    with st.expander("🔍 展开核对底层单季 EPS 明细"):
-        show_q = qdf_detail.sort_values("end", ascending=False).copy()
-        show_q["end"] = show_q["end"].dt.strftime("%Y-%m-%d")
-        show_q["filed"] = show_q["filed"].dt.strftime("%Y-%m-%d")
-        show_q["val"] = show_q["val"].round(4)
-        st.dataframe(
-            show_q[["end", "filed", "val"]].rename(columns={
-                "end": "财报期末",
-                "filed": "首次披露日",
-                "val": "拆股调整后单季EPS($)",
-            }),
-            height=200,
-            use_container_width=True,
-        )
+# 底部折叠明细（个股显示单季 EPS，ETF 显示参与拟合的核心重仓股权重）
+if detail_meta is not None:
+    if detail_meta.get("is_etf"):
+        with st.expander(f"🔍 说明：{ticker} 为 ETF 基金，点击查看参与拟合的前十大核心成分股"):
+            st.caption("注：ETF 无 SEC 10-Q/10-K 财报，曲线由核心重仓股历史加权盈利率(E/P)合成，并按基金最新整体 PE 校准。")
+            st.dataframe(detail_meta["holdings_df"], height=180, use_container_width=True)
+    elif detail_meta.get("qdf") is not None:
+        with st.expander("🔍 展开核对底层单季 EPS 明细"):
+            show_q = detail_meta["qdf"].sort_values("end", ascending=False).copy()
+            show_q["end"] = show_q["end"].dt.strftime("%Y-%m-%d")
+            show_q["filed"] = show_q["filed"].dt.strftime("%Y-%m-%d")
+            show_q["val"] = show_q["val"].round(4)
+            st.dataframe(
+                show_q[["end", "filed", "val"]].rename(columns={
+                    "end": "财报期末",
+                    "filed": "首次披露日",
+                    "val": "拆股调整后单季EPS($)",
+                }),
+                height=200,
+                use_container_width=True,
+            )
 
-st.caption("数据来源：Yahoo Finance（股价）、SEC EDGAR（财务数据），仅供参考，不构成投资建议。")
+st.caption("数据来源：Yahoo Finance、SEC EDGAR，仅供参考，不构成投资建议。")
