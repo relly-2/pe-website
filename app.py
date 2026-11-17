@@ -8,7 +8,7 @@ from email.utils import parsedate_to_datetime
 import html
 
 # 请把邮箱改成你自己的（SEC 要求）
-HEADERS = {"User-Agent": "PE-Website your-email@example.com"}
+HEADERS = {"User-Agent": "PE-Website aihuaxiawenhua@gmail.com"}
 
 # 你的 Seeking Alpha 专属推广链接
 SA_REFERRAL_URL = (
@@ -155,7 +155,6 @@ def format_pub_date(raw_date):
             return s[:16]
 
 
-# Seeking Alpha 官方评级映射 -> (中文文案, CSS类名)
 RATING_MAP = {
     "strong_buy": ("强烈买入", "sa-strong-buy"),
     "strong buy": ("强烈买入", "sa-strong-buy"),
@@ -175,7 +174,6 @@ RATING_MAP = {
 
 
 def normalize_rating_str(raw_rating):
-    """把 Apify 返回的 rating 字符串（如 'Strong Buy', 'Buy', 'Hold' 等）标准化"""
     if not raw_rating:
         return None
     k = str(raw_rating).strip().lower().replace("-", " ")
@@ -188,7 +186,6 @@ def normalize_rating_str(raw_rating):
 
 
 def translate_titles_to_zh(titles):
-    """批量将英文标题翻译为简体中文"""
     if not titles:
         return titles
     sep = "\n ||| \n"
@@ -201,7 +198,8 @@ def translate_titles_to_zh(titles):
         )
         if r.status_code == 200:
             data = r.json()
-            translated_full = "".join(seg[0] for seg in data[0] if seg and seg[0])
+            first_block = data[0] if data else []
+            translated_full = "".join(seg[0] for seg in first_block if seg and seg[0])
             parts = [p.strip() for p in translated_full.split("|||")]
             if len(parts) == len(titles):
                 return parts
@@ -211,7 +209,6 @@ def translate_titles_to_zh(titles):
 
 
 def get_apify_token():
-    """安全读取 Streamlit Secrets 中的 APIFY_API_TOKEN"""
     try:
         return str(st.secrets.get("APIFY_API_TOKEN", "")).strip()
     except Exception:
@@ -220,15 +217,9 @@ def get_apify_token():
 
 @st.cache_data(ttl=21600)
 def load_seeking_alpha_feed(symbol, has_token):
-    """
-    通过 Apify 的 Seeking Alpha Stock Analysis Scraper 获取官网真实分析文章及作者评级（缓存 6 小时省额度）：
-    - 输入: tickerSymbol, analysisType="analysis", maxArticles=12
-    - 输出字段: article_title, author_name, publish_date, rating ("Strong Buy"/"Buy"/"Hold"/"Sell"/"Strong Sell")
-    """
     articles = []
     token = get_apify_token() if has_token else ""
 
-    # 主通道：使用 Apify Actor 同步运行并直接返回 Dataset JSON
     if token:
         api_url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
         payload = {
@@ -237,7 +228,6 @@ def load_seeking_alpha_feed(symbol, has_token):
             "maxArticles": 12,
         }
         try:
-            # Apify 云端启动真实浏览器过盾抓取通常需要 15~45 秒，首次查询后自动缓存 6 小时秒开
             r = requests.post(
                 api_url,
                 params={"token": token},
@@ -255,7 +245,6 @@ def load_seeking_alpha_feed(symbol, has_token):
                         ).strip()
                         if not title:
                             continue
-                        # 确保排除混入的快讯（若有 analysis_type 字段为 News 则跳过）
                         atype = str(item.get("analysis_type") or "analysis").strip().lower()
                         aurl = str(item.get("article_url") or item.get("url") or "")
                         if atype == "news" or ("/news/" in aurl and "/article/" not in aurl):
@@ -286,7 +275,6 @@ def load_seeking_alpha_feed(symbol, has_token):
         except Exception:
             pass
 
-    # 备用兜底：如果还未配置 Token 或额度用尽，回退官方 XML 分析流（仅取 /article/ 分析文章，不瞎猜评级）
     if not articles:
         sa_xml_url = f"https://seekingalpha.com/api/sa/combined/{symbol}.xml"
         try:
@@ -322,7 +310,6 @@ def load_seeking_alpha_feed(symbol, has_token):
         except Exception:
             pass
 
-    # 批量翻译中文标题 + 挂载官网真实评级色块
     if articles:
         zh_titles = translate_titles_to_zh([a["title_en"] for a in articles])
         for art, zh in zip(articles, zh_titles):
@@ -362,7 +349,7 @@ def get_sec_facts(symbol):
 
 def build_ttm_eps(facts, splits_series):
     rows = None
-    for concept in ["EarningsPerShareDiluted", "EarningsPerShareBasic"]:
+    for concept in ("EarningsPerShareDiluted", "EarningsPerShareBasic"):
         if concept in facts and "USD/shares" in facts[concept]["units"]:
             rows = facts[concept]["units"]["USD/shares"]
             break
@@ -566,8 +553,8 @@ def load_etf_pe(symbol, years):
     if not ep_frames:
         return None, None
 
-    merged = pd.concat([f[[2]](#__2) for f in ep_frames], axis=1).sort_index().ffill()
-    weights = pd.Series({f[0]: f[[1]](#__1) for f in ep_frames})
+    merged = pd.concat([frame for _, _, frame in ep_frames], axis=1).sort_index().ffill()
+    weights = pd.Series({sym: w for sym, w, _ in ep_frames})
 
     valid_mask = merged.notna()
     weighted_ep = merged.multiply(weights, axis=1).sum(axis=1)
@@ -676,7 +663,7 @@ with row1_left:
                 )
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-# 【右上角】：Seeking Alpha 股票深度分析列表（Apify 官方抓取 + 评级前置 + 专属推广链接）
+# 【右上角】：Seeking Alpha 股票深度分析列表
 with row1_right:
     with st.container(border=True):
         safe_ref_url = html.escape(SA_REFERRAL_URL, quote=True)
