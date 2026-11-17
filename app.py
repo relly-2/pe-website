@@ -20,26 +20,30 @@ def load_pe(symbol, years):
     hist.index = hist.index.tz_localize(None)
     df = hist.reset_index()
     df.columns = ["date", "close"]
-    df["date"] = pd.to_datetime(df["date"])
+    # 统一成 datetime64[ns]，避免与财报日期类型不一致
+    df["date"] = pd.to_datetime(df["date"]).astype("datetime64[ns]")
+    df["close"] = df["close"].astype(float)
 
     # 获取季度每股稀释收益
     inc = t.quarterly_income_stmt
     if inc is None or inc.empty or "Diluted EPS" not in inc.index:
         return None
     eps = inc.loc["Diluted EPS"].dropna().sort_index()
-    ttm = eps.rolling(4).sum().dropna()
+    ttm = eps.astype(float).rolling(4).sum().dropna()
     if ttm.empty:
         return None
 
-    # 财报通常在季度结束后约 45 天发布，用它作为"可用日期"，减少未来信息
+    # 财报通常在季度结束后约 45 天发布，用它作为"可用日期"
+    filed_dates = (pd.to_datetime(ttm.index) + pd.Timedelta(days=45)).astype("datetime64[ns]")
     eps_df = pd.DataFrame({
-        "filed": pd.to_datetime(ttm.index) + pd.Timedelta(days=45),
-        "ttm": ttm.values,
-    }).sort_values("filed")
+        "filed": filed_dates,
+        "ttm": ttm.values.astype(float),
+    }).sort_values("filed").reset_index(drop=True)
 
     # 每个交易日匹配"当时已经公布的最新 TTM EPS"
     df = pd.merge_asof(
-        df.sort_values("date"), eps_df,
+        df.sort_values("date").reset_index(drop=True),
+        eps_df,
         left_on="date", right_on="filed", direction="backward",
     )
     df["pe"] = (df["close"] / df["ttm"]).where(df["ttm"] > 0)
