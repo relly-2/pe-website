@@ -377,16 +377,34 @@ def finalize_articles(articles):
     return articles
 
 
-def run_puppeteer_real_pages(token, symbol, schema_ver):
-    """
-    1. 从官方 XML 取最新 8 篇分析文章 URL；
-    2. 交给 Apify Puppeteer 打开真实文章页；
-    3. 截获页面自身的 /api/v3/articles/{id} 响应 + 收集 SSR 内嵌的 sentiment 片段；
-    4. 检测反爬验证页（PerimeterX），被拦时换会话重试，最后一次仍被拦则如实上报。
-    """
+SA_FIRST_WAIT_SECS = 100      # 新启动抓取后，页面最多同步等待的秒数
+SA_RECHECK_WAIT_SECS = 20     # 之后每次刷新页面，最多再等待的秒数
+SA_PENDING_MAX_SECS = 1800    # 超过 30 分钟仍未完成的任务直接放弃
+SA_RUN_TIMEOUT_SECS = 300     # Apify 端单次运行的时间上限
+SA_TERMINAL = ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT")
+
+
+class SARatingUnavailable(Exception):
+    """没抓到任何评级。抛异常可让 st.cache_data 不缓存这次失败结果。"""
+    pass
+
+
+class SARatingPending(SARatingUnavailable):
+    """Apify 任务还在跑，下次刷新页面时继续检查同一个任务。"""
+    pass
+
+
+@st.cache_resource
+def _sa_state_registry():
+    """保存：各股票最近一次失败时间 + 尚未跑完的 Apify 任务。"""
+    return {}
+
+
+def start_puppeteer_run(token, symbol, schema_ver):
+    """启动 Apify 任务，立即返回 (run_id, dataset_id, 说明)，不在这里等待。"""
     base_articles = fetch_sa_xml_articles(symbol, 8)
     if not base_articles:
-        return None, "XML未找到分析文章"
+        return None, None, "XML未找到分析文章"
 
     start_urls = [
         {
@@ -423,7 +441,7 @@ def run_puppeteer_real_pages(token, symbol, schema_ver):
                 try {
                     if (request.userData._capturedV3) return;                 // 不覆盖已截获的结果
                     const u = res.url();
-                    if (!/\/api\/v3\/articles\/\d+(\?|$)/.test(u)) return;    // 只认文章本体，排除 /comments 等子接口
+                    if (!/\/api\/v3\/articles\/\d+(\?|$)/.test(u)) return;    // 只认文章本体
                     if (res.status() !== 200) return;
                     const jb = await res.json();
                     if (jb && jb.data && !Array.isArray(jb.data)) {
@@ -447,14 +465,12 @@ def run_puppeteer_real_pages(token, symbol, schema_ver):
     page_fn = r"""
     async function pageFunction(context) {
         const { page, request } = context;
-        // 给前端水合渲染及原生 XHR 响应留 2.5 秒
         await new Promise(r => setTimeout(r, 2500));
 
         const info = await page.evaluate(() => {
             const htmlTxt = document.documentElement.innerHTML || '';
             const blocked = /px-captcha|press\s*&(amp;)?\s*hold|access to this page has been denied/i.test(htmlTxt);
 
-            // 收集每个 "type":"sentiment" 对象附近的片段（兼容被转义的 \"type\":\"sentiment\"）
             const snippets = [];
             const re = /\\?"type\\?"\s*:\s*\\?"sentiment\\?"/g;
             let m;
@@ -470,8 +486,8 @@ def run_puppeteer_real_pages(token, symbol, schema_ver):
             };
         });
 
-        // 被反爬拦截：前两次抛错换会话重试；最后一次如实返回，方便诊断
-        if (info.blocked && (request.retryCount || 0) < 2) {
+        // 被反爬拦截：只换会话重试 1 次；第二次仍被拦就如实返回，方便诊断
+        if (info.blocked && (request.retryCount || 0) < 1) {
             try { if (context.session && context.session.retire) context.session.retire(); } catch (e) {}
             throw new Error('PX_BLOCKED');
         }
@@ -498,41 +514,53 @@ def run_puppeteer_real_pages(token, symbol, schema_ver):
         "pageFunction": page_fn,
         "proxyConfiguration": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
         "useChrome": True,
-        "maxConcurrency": 4,
+        "maxConcurrency": 8,
         "maxPagesPerCrawl": 8,
-        "maxRequestRetries": 2,
-        "pageLoadTimeoutSecs": 35,
+        "maxRequestRetries": 1,
+        "pageLoadTimeoutSecs": 30,
     }
 
     r_start = requests.post(
         f"https://api.apify.com/v2/acts/{PUPPETEER_ACTOR_ID}/runs",
-        params={"token": token},
+        params={"token": token, "timeout": SA_RUN_TIMEOUT_SECS},
         json=pup_input,
         timeout=(5, 15),
     )
     if r_start.status_code not in (200, 201):
-        return None, f"启动HTTP {r_start.status_code}"
+        return None, None, f"启动HTTP {r_start.status_code}"
 
     rdata = r_start.json().get("data") or {}
     run_id = rdata.get("id")
-    ds_id = rdata.get("defaultDatasetId")
-    f_status = "RUNNING"
+    if not run_id:
+        return None, None, "启动响应里没有run id"
+    return run_id, rdata.get("defaultDatasetId"), "已启动"
 
-    for _ in range(50):  # 最多等 150 秒（含重试）
+
+def wait_for_run(token, run_id, max_secs):
+    """轮询任务状态，最多等 max_secs 秒。返回 (状态, dataset_id)。"""
+    status, ds_id = "RUNNING", None
+    deadline = time.time() + max_secs
+    while True:
+        try:
+            rp = requests.get(
+                f"https://api.apify.com/v2/actor-runs/{run_id}",
+                params={"token": token},
+                timeout=(4, 10),
+            )
+            if rp.status_code == 200:
+                pd_obj = rp.json().get("data") or {}
+                status = pd_obj.get("status") or status
+                ds_id = pd_obj.get("defaultDatasetId") or ds_id
+        except requests.RequestException:
+            pass
+        if status in SA_TERMINAL or time.time() >= deadline:
+            break
         time.sleep(3)
-        rp = requests.get(
-            f"https://api.apify.com/v2/actor-runs/{run_id}",
-            params={"token": token},
-            timeout=(4, 10),
-        )
-        if rp.status_code == 200:
-            pd_obj = rp.json().get("data") or {}
-            f_status = pd_obj.get("status")
-            ds_id = pd_obj.get("defaultDatasetId") or ds_id
-            if f_status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
-                break
+    return status, ds_id
 
-    if f_status == "SUCCEEDED" and ds_id:
+
+def fetch_dataset_items(token, ds_id):
+    try:
         ri = requests.get(
             f"https://api.apify.com/v2/datasets/{ds_id}/items",
             params={"token": token},
@@ -540,15 +568,16 @@ def run_puppeteer_real_pages(token, symbol, schema_ver):
         )
         if ri.status_code == 200:
             arr = ri.json()
-            if isinstance(arr, list) and arr:
-                return arr, f"SUCCEEDED(run={str(run_id)[:8]}, 共{len(arr)}篇)"
-        return None, f"SUCCEEDED但数据集为空(run={str(run_id)[:8]})"
-    return None, f"状态={f_status}(run={str(run_id)[:8]})"
+            if isinstance(arr, list):
+                return arr
+    except Exception:
+        pass
+    return []
 
 
 def parse_dataset_array(arr, symbol, schema_ver):
     if not isinstance(arr, list) or not arr:
-        return [], "空数组"
+        return [], "数据集暂无记录"
     valid_rows = [
         x for x in arr
         if isinstance(x, dict)
@@ -593,20 +622,51 @@ def parse_dataset_array(arr, symbol, schema_ver):
     return out, diag
 
 
-class SARatingUnavailable(Exception):
-    """没抓到任何评级。抛异常可让 st.cache_data 不缓存这次失败结果。"""
-    pass
+def _resolve_run(token, symbol, schema_ver, run_id, ds_id, max_wait):
+    """
+    等待任务并读取数据集（没跑完也读已完成的部分，用于诊断）。
+    返回 (带评级的文章列表或None, 说明, 任务是否已结束)。
+    """
+    status, ds2 = wait_for_run(token, run_id, max_wait)
+    ds_id = ds2 or ds_id
+    finished = status in SA_TERMINAL
+    arr = fetch_dataset_items(token, ds_id) if ds_id else []
+    cand, diag = parse_dataset_array(arr, symbol, schema_ver)
+    note = f"run={str(run_id)[:8]} 状态={status}, 已出结果{len(arr)}篇 | {diag}"
+    if finished and cand and any(a.get("rating_key") for a in cand):
+        return cand, note, True
+    return None, note, finished
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def _load_sa_rated(symbol, schema_ver):
-    """只有成功拿到至少一个评级才会被缓存 6 小时；否则抛 SARatingUnavailable。"""
+    """只有成功拿到至少一个评级才会被缓存 6 小时；否则抛异常，不缓存。"""
     token = get_apify_token()
     if not token:
         raise SARatingUnavailable("未配置APIFY_API_TOKEN")
-    notes = []
+    reg = _sa_state_registry()
+    pkey = f"pending:{schema_ver}:{symbol}"
 
-    # 1. 复用最近 6 小时内、同股票、且确实带评级的数据集
+    # 1. 上次没等完的任务：继续检查同一个任务，不重新启动
+    pending = reg.get(pkey)
+    if pending:
+        if time.time() - pending["started"] > SA_PENDING_MAX_SECS:
+            reg.pop(pkey, None)
+        else:
+            cand, note, finished = _resolve_run(
+                token, symbol, schema_ver,
+                pending["run_id"], pending.get("ds_id"), SA_RECHECK_WAIT_SECS,
+            )
+            if cand:
+                reg.pop(pkey, None)
+                return finalize_articles(cand), note
+            if not finished:
+                raise SARatingPending(note)
+            reg.pop(pkey, None)
+            raise SARatingUnavailable(note)
+
+    # 2. 复用最近 6 小时内、同股票、且确实带评级的数据集
+    prev_note = ""
     try:
         r_hist = requests.get(
             f"https://api.apify.com/v2/acts/{PUPPETEER_ACTOR_ID}/runs",
@@ -624,32 +684,33 @@ def _load_sa_rated(symbol, schema_ver):
                     ).total_seconds() / 3600.0
                     if age_h > 6:
                         fresh = False
-                if run_info.get("status") == "SUCCEEDED" and ds_id and fresh:
-                    rds = requests.get(
-                        f"https://api.apify.com/v2/datasets/{ds_id}/items",
-                        params={"token": token},
-                        timeout=(4, 10),
+                if run_info.get("status") in ("SUCCEEDED", "TIMED-OUT") and ds_id and fresh:
+                    cand, diag = parse_dataset_array(
+                        fetch_dataset_items(token, ds_id), symbol, schema_ver
                     )
-                    if rds.status_code == 200:
-                        cand, diag = parse_dataset_array(rds.json(), symbol, schema_ver)
-                        if cand and any(a.get("rating_key") for a in cand):
-                            return finalize_articles(cand), f"命中{schema_ver}缓存({ds_id[:8]}) | {diag}"
+                    if cand and any(a.get("rating_key") for a in cand):
+                        return finalize_articles(cand), f"命中{schema_ver}缓存({ds_id[:8]}) | {diag}"
+                    if cand and not prev_note:
+                        prev_note = f" | 此前一次运行({ds_id[:8]}): {diag}"
     except Exception:
         pass
 
-    # 2. 启动新的抓取
-    try:
-        arr, note = run_puppeteer_real_pages(token, symbol, schema_ver)
-        notes.append(f"真实页面{schema_ver}:{note}")
-        if arr:
-            cand, diag = parse_dataset_array(arr, symbol, schema_ver)
-            notes.append(diag)
-            if cand and any(a.get("rating_key") for a in cand):
-                return finalize_articles(cand), " | ".join(notes)
-    except Exception as e:
-        notes.append(f"抓取异常:{str(e)[:80]}")
+    # 3. 启动新任务，先登记为“进行中”，再限时等待
+    run_id, ds_id, start_note = start_puppeteer_run(token, symbol, schema_ver)
+    if not run_id:
+        raise SARatingUnavailable(start_note + prev_note)
+    reg[pkey] = {"run_id": run_id, "ds_id": ds_id, "started": time.time()}
 
-    raise SARatingUnavailable(" | ".join(notes) or "未获取到评级")
+    cand, note, finished = _resolve_run(
+        token, symbol, schema_ver, run_id, ds_id, SA_FIRST_WAIT_SECS
+    )
+    if cand:
+        reg.pop(pkey, None)
+        return finalize_articles(cand), note
+    if not finished:
+        raise SARatingPending(note + prev_note)
+    reg.pop(pkey, None)
+    raise SARatingUnavailable(note + prev_note)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -661,35 +722,35 @@ def _load_sa_xml_only(symbol):
         return []
 
 
-@st.cache_resource
-def _sa_fail_registry():
-    """记录各股票最近一次评级抓取失败的时间，避免每次页面刷新都重启 Apify。"""
-    return {}
-
-
 def load_seeking_alpha_feed(symbol, has_token):
-    reg = _sa_fail_registry()
+    reg = _sa_state_registry()
     note = ""
     if has_token:
         key = f"{CACHE_SCHEMA_VER}:{symbol}"
         last = reg.get(key)
-        if not last or time.time() - last[0] > SA_FAIL_RETRY_SECS:
+        has_pending = f"pending:{key}" in reg
+        if has_pending or not last or time.time() - last[0] > SA_FAIL_RETRY_SECS:
             try:
-                return _load_sa_rated(symbol, CACHE_SCHEMA_VER)
+                result = _load_sa_rated(symbol, CACHE_SCHEMA_VER)
+                reg.pop(key, None)
+                return result
+            except SARatingPending as e:
+                note = f"评级抓取仍在进行中，稍后刷新页面会继续检查同一任务: {e} | "
             except SARatingUnavailable as e:
                 reg[key] = (time.time(), str(e))
             except Exception as e:
                 reg[key] = (time.time(), f"异常:{str(e)[:80]}")
-        fail_ts, fail_msg = reg[key]
-        wait_min = max(0, int((SA_FAIL_RETRY_SECS - (time.time() - fail_ts)) / 60))
-        note = f"评级抓取失败（约{wait_min}分钟后自动重试）: {fail_msg} | "
+        if not note and key in reg:
+            fail_ts, fail_msg = reg[key]
+            wait_min = max(0, int((SA_FAIL_RETRY_SECS - (time.time() - fail_ts)) / 60))
+            note = f"评级抓取失败（约{wait_min}分钟后自动重试）: {fail_msg} | "
 
     articles = _load_sa_xml_only(symbol)
     note += "回退官方XML流（无评级）" if articles else "官方XML流也未取到文章"
     return articles, note
 
 
-@st.cache_data(ttl=86400)
+
 def get_cik_map():
     r = requests.get("https://www.sec.gov/files/company_tickers.json",
                      headers=HEADERS, timeout=30)
