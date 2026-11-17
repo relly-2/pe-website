@@ -3,6 +3,9 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 import requests
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+import html
 
 # 请把邮箱改成你自己的（SEC 要求）
 HEADERS = {"User-Agent": "PE-Website aihuaxiawenhua@gmail.com"}
@@ -36,6 +39,44 @@ st.markdown("""
         border-radius: 8px;
         text-align: center;
     }
+    /* Seeking Alpha 文章列表紧凑滚动样式，与左侧卡片高度对齐 */
+    .sa-scroll-box {
+        height: 255px;
+        overflow-y: auto;
+        padding-right: 6px;
+    }
+    .sa-item {
+        padding: 8px 4px;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.16);
+    }
+    .sa-item:last-child {
+        border-bottom: none;
+    }
+    .sa-item a {
+        text-decoration: none;
+        font-size: 0.88rem;
+        font-weight: 500;
+        line-height: 1.35;
+        display: block;
+    }
+    .sa-item a:hover {
+        text-decoration: underline;
+    }
+    .sa-meta {
+        font-size: 0.75rem;
+        color: #888888;
+        margin-top: 3px;
+    }
+    .sa-badge {
+        display: inline-block;
+        padding: 1px 6px;
+        border-radius: 4px;
+        font-size: 0.7rem;
+        margin-right: 6px;
+        background-color: rgba(255, 115, 0, 0.12);
+        color: #e66a00;
+        font-weight: 600;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -63,6 +104,95 @@ def to_ns(s):
     return dt.astype("datetime64[ns]")
 
 
+def format_pub_date(raw_date):
+    if not raw_date:
+        return ""
+    try:
+        dt = parsedate_to_datetime(raw_date)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return raw_date[:16]
+
+
+@st.cache_data(ttl=1800)
+def load_seeking_alpha_feed(symbol):
+    """
+    获取某只股票在 Seeking Alpha 上的最新分析列表（缓存 30 分钟）：
+    优先走 Seeking Alpha 官方按股票订阅 RSS（优先筛选 Analysis 深度分析文章），
+    若云服务器 IP 被防爬拦截，则自动无缝回退到 Google News 的 site:seekingalpha.com 源。
+    """
+    browser_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+    }
+
+    articles = []
+
+    # 通道 1：Seeking Alpha 官方股票 XML Feed
+    sa_url = f"https://seekingalpha.com/api/sa/combined/{symbol}.xml"
+    try:
+        r = requests.get(sa_url, headers=browser_headers, timeout=12)
+        if r.status_code == 200 and r.content:
+            root = ET.fromstring(r.content)
+            ns = {"sa": "https://seekingalpha.com/api/1.0"}
+            all_items = []
+            for item in root.findall("./channel/item"):
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                pub = format_pub_date(item.findtext("pubDate") or "")
+                author = (item.findtext("sa:author_name", namespaces=ns) or "").strip()
+                is_article = "/article/" in link
+                if title and link:
+                    all_items.append({
+                        "title": title,
+                        "link": link,
+                        "date": pub,
+                        "author": author or "Seeking Alpha",
+                        "kind": "深度分析" if is_article else "快讯/动态",
+                        "is_article": is_article,
+                    })
+            # 优先展示深度分析（/article/），不够再用快讯补齐
+            only_analysis = [x for x in all_items if x["is_article"]]
+            other_news = [x for x in all_items if not x["is_article"]]
+            articles = (only_analysis + other_news)[:15]
+    except Exception:
+        pass
+
+    # 通道 2（兜底）：若官方 XML 被拦截或为空，通过 Google News RSS 精准检索 Seeking Alpha 分析页
+    if not articles:
+        gn_url = (
+            f"https://news.google.com/rss/search?"
+            f"q=site:seekingalpha.com/article+{symbol}&hl=en-US&gl=US&ceid=US:en"
+        )
+        try:
+            r = requests.get(gn_url, headers=browser_headers, timeout=12)
+            if r.status_code == 200 and r.content:
+                root = ET.fromstring(r.content)
+                for item in root.findall("./channel/item")[:15]:
+                    raw_title = (item.findtext("title") or "").strip()
+                    # 去掉末尾重复的 " - Seeking Alpha"
+                    clean_title = raw_title.rsplit(" - Seeking Alpha", 1)[0].strip()
+                    link = (item.findtext("link") or "").strip()
+                    pub = format_pub_date(item.findtext("pubDate") or "")
+                    if clean_title and link:
+                        articles.append({
+                            "title": clean_title,
+                            "link": link,
+                            "date": pub,
+                            "author": "Seeking Alpha Analyst",
+                            "kind": "深度分析",
+                            "is_article": True,
+                        })
+        except Exception:
+            pass
+
+    return articles
+
+
 @st.cache_data(ttl=86400)
 def get_cik_map():
     r = requests.get("https://www.sec.gov/files/company_tickers.json",
@@ -74,7 +204,6 @@ def get_cik_map():
 @st.cache_data(ttl=86400)
 def get_sec_facts(symbol):
     cik_map = get_cik_map()
-    # 兼容 BRK.B -> BRK-B 格式
     cik = cik_map.get(symbol) or cik_map.get(symbol.replace(".", "-"))
     if cik is None:
         return None
@@ -192,7 +321,6 @@ def build_ttm_eps(facts, splits_series):
 
 @st.cache_data(ttl=86400)
 def load_stock_pe(symbol, years):
-    """个股历史 PE 计算（SEC + Yahoo）"""
     facts = get_sec_facts(symbol)
     if not facts:
         return None, None
@@ -240,7 +368,6 @@ def load_stock_pe(symbol, years):
     return df, qdf
 
 
-# 常见主流 ETF 兜底重仓股权重（防止 yfinance 偶尔未返回 holdings）
 FALLBACK_HOLDINGS = {
     "SPY": [("AAPL", 0.07), ("MSFT", 0.065), ("NVDA", 0.06), ("AMZN", 0.038), ("META", 0.025), ("GOOGL", 0.04), ("BRK-B", 0.018), ("AVGO", 0.018), ("LLY", 0.015), ("JPM", 0.014)],
     "VOO": [("AAPL", 0.07), ("MSFT", 0.065), ("NVDA", 0.06), ("AMZN", 0.038), ("META", 0.025), ("GOOGL", 0.04), ("BRK-B", 0.018), ("AVGO", 0.018), ("LLY", 0.015), ("JPM", 0.014)],
@@ -251,12 +378,6 @@ FALLBACK_HOLDINGS = {
 
 @st.cache_data(ttl=86400)
 def load_etf_pe(symbol, years):
-    """
-    ETF 历史 PE 估算：
-    1. 从 Yahoo Finance 获取 ETF 当前官方 trailingPE 及前十大重仓股权重
-    2. 计算核心重仓股组合的加权盈利率 (E/P = 1/PE) 历史序列
-    3. 按当前 ETF 官方真实 PE 对齐校准，还原出连续历史走势
-    """
     t = yf.Ticker(symbol)
     info = {}
     try:
@@ -264,10 +385,8 @@ def load_etf_pe(symbol, years):
     except Exception:
         pass
 
-    quote_type = info.get("quoteType", "")
     official_pe = info.get("trailingPE")
 
-    # 提取前十大重仓股列表 [(symbol, weight), ...]
     holdings = []
     try:
         fd = t.funds_data
@@ -286,7 +405,6 @@ def load_etf_pe(symbol, years):
     if not holdings:
         return None, None
 
-    # 计算各重仓股的历史盈利率 (E/P = ttm / close)，比直接加权 PE 更科学（不怕单只股票微利导致 PE 暴涨失真）
     ep_frames = []
     used_holdings = []
     for h_sym, weight in holdings[:10]:
@@ -302,7 +420,6 @@ def load_etf_pe(symbol, years):
     if not ep_frames:
         return None, None
 
-    # 对齐所有成分股交易日并按有效权重每日加权平均 E/P
     merged = pd.concat([f[2] for f in ep_frames], axis=1).sort_index().ffill()
     weights = pd.Series({f[0]: f[1] for f in ep_frames})
 
@@ -317,10 +434,8 @@ def load_etf_pe(symbol, years):
     if res_df.empty:
         return None, None
 
-    # 用 Yahoo 官方最新 ETF 整体 trailingPE 做水平校准（消除前十大重仓与全样本的固定估值差）
     if official_pe and official_pe > 0:
         scale = float(official_pe) / res_df["pe"].iloc[-1]
-        # 限制校准系数在合理区间
         if 0.4 <= scale <= 2.5:
             res_df["pe"] = res_df["pe"] * scale
 
@@ -333,7 +448,6 @@ def load_etf_pe(symbol, years):
 
 
 def load_any_pe(symbol, years):
-    """先查 SEC 个股，若不在 SEC 名单中则自动切换为 ETF 重仓拟合模式"""
     df, qdf = load_stock_pe(symbol, years)
     if df is not None and not df["pe"].dropna().empty:
         return df, {"is_etf": False, "qdf": qdf}
@@ -355,7 +469,7 @@ detail_meta = None
 with row1_left:
     with st.container(border=True):
         if ticker:
-            with st.spinner(f"正在加载 {ticker} 数据（ETF 首次计算需拉取成分股约 15~30 秒）..."):
+            with st.spinner(f"正在加载 {ticker} 估值数据..."):
                 df, detail_meta = load_any_pe(ticker, years)
 
             is_etf = bool(detail_meta and detail_meta.get("is_etf"))
@@ -396,16 +510,50 @@ with row1_left:
                 )
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-# 【右上角】：预留功能位 1
+# 【右上角】：Seeking Alpha 最新分析列表
 with row1_right:
     with st.container(border=True):
-        st.markdown("**🧩 预留模块 1（右上）**")
-        st.markdown("""
-            <div class="placeholder-box">
-                <div>🚧 功能预留位</div>
-                <div style="font-size: 0.85rem; margin-top: 6px;">例如：历史股价走势 / 市销率(PS) / 市净率(PB)</div>
-            </div>
-        """, unsafe_allow_html=True)
+        sa_head1, sa_head2 = st.columns([3, 1])
+        with sa_head1:
+            st.markdown(f"**📰 Seeking Alpha 最新分析 ({ticker})**")
+        with sa_head2:
+            sa_page_url = f"https://seekingalpha.com/symbol/{ticker}/analysis"
+            st.markdown(
+                f"<div style='text-align:right; font-size:0.8rem;'>"
+                f"<a href='{sa_page_url}' target='_blank' style='text-decoration:none;'>查看全部 ↗</a></div>",
+                unsafe_allow_html=True,
+            )
+
+        if ticker:
+            with st.spinner("正在拉取 Seeking Alpha 分析列表..."):
+                sa_articles = load_seeking_alpha_feed(ticker)
+
+            if not sa_articles:
+                st.markdown("""
+                    <div class="placeholder-box">
+                        <div>📭 暂未获取到该代码的最新 Seeking Alpha 分析文章</div>
+                        <div style="font-size: 0.8rem; margin-top: 6px;">可点击右上角“查看全部”前往官网浏览</div>
+                    </div>
+                """, unsafe_allow_html=True)
+            else:
+                items_html = []
+                for art in sa_articles:
+                    safe_title = html.escape(art["title"])
+                    safe_author = html.escape(art["author"])
+                    safe_date = html.escape(art["date"])
+                    safe_kind = html.escape(art["kind"])
+                    safe_link = html.escape(art["link"], quote=True)
+                    items_html.append(
+                        f'<div class="sa-item">'
+                        f'<a href="{safe_link}" target="_blank" rel="noopener noreferrer">'
+                        f'<span class="sa-badge">{safe_kind}</span>{safe_title}</a>'
+                        f'<div class="sa-meta">✍️ {safe_author} &nbsp;·&nbsp; 🕒 {safe_date}</div>'
+                        f'</div>'
+                    )
+                st.markdown(
+                    f'<div class="sa-scroll-box">{"".join(items_html)}</div>',
+                    unsafe_allow_html=True,
+                )
 
 # 【左下角】：预留功能位 2
 with row2_left:
@@ -429,7 +577,7 @@ with row2_right:
             </div>
         """, unsafe_allow_html=True)
 
-# 底部折叠明细（个股显示单季 EPS，ETF 显示参与拟合的核心重仓股权重）
+# 底部折叠明细
 if detail_meta is not None:
     if detail_meta.get("is_etf"):
         with st.expander(f"🔍 说明：{ticker} 为 ETF 基金，点击查看参与拟合的前十大核心成分股"):
@@ -451,4 +599,4 @@ if detail_meta is not None:
                 use_container_width=True,
             )
 
-st.caption("数据来源：Yahoo Finance、SEC EDGAR，仅供参考，不构成投资建议。")
+st.caption("数据来源：Yahoo Finance、SEC EDGAR、Seeking Alpha，仅供参考，不构成投资建议。")
