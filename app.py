@@ -5,17 +5,19 @@ import plotly.graph_objects as go
 import requests
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 import html
 
 # 请把邮箱改成你自己的（SEC 要求）
-HEADERS = {"User-Agent": "PE-Website aihuaxiawenhua@gmail.com"}
+HEADERS = {"User-Agent": "PE-Website your-email@example.com"}
 
 # 你的 Seeking Alpha 专属推广链接
 SA_REFERRAL_URL = (
     "https://seekingalpha.com/subscriptions/refer-a-friend"
     "?source=refer_friend_link&user_referrer=91b69c96c70651cc37407aca"
 )
+
+# Apify Actor ID（方案二：专门提取 Seeking Alpha 分析文章及作者评级）
+APIFY_ACTOR_ID = "fortuitous_pirate~seekingalpha-stock-analysis-scraper"
 
 st.set_page_config(page_title="美股估值看板", layout="wide")
 
@@ -60,7 +62,7 @@ st.markdown("""
         border-bottom: none;
     }
     .sa-title-line {
-        line-height: 1.45;
+        line-height: 1.48;
     }
     .sa-title-line a {
         text-decoration: none;
@@ -139,22 +141,26 @@ def to_ns(s):
 def format_pub_date(raw_date):
     if not raw_date:
         return ""
+    s = str(raw_date).strip()
     try:
-        dt = parsedate_to_datetime(raw_date)
+        dt = parsedate_to_datetime(s)
         return dt.strftime("%Y-%m-%d %H:%M")
     except Exception:
         try:
-            dt = pd.to_datetime(raw_date)
+            dt = pd.to_datetime(s)
+            if dt.hour == 0 and dt.minute == 0 and len(s) <= 10:
+                return dt.strftime("%Y-%m-%d")
             return dt.strftime("%Y-%m-%d %H:%M")
         except Exception:
-            return str(raw_date)[:16]
+            return s[:16]
 
 
 # Seeking Alpha 官方评级映射 -> (中文文案, CSS类名)
 RATING_MAP = {
     "strong_buy": ("强烈买入", "sa-strong-buy"),
-    "very_bullish": ("强烈买入", "sa-strong-buy"),
     "strong buy": ("强烈买入", "sa-strong-buy"),
+    "very_bullish": ("强烈买入", "sa-strong-buy"),
+    "very bullish": ("强烈买入", "sa-strong-buy"),
     "buy": ("买入", "sa-buy"),
     "bullish": ("买入", "sa-buy"),
     "hold": ("持有", "sa-hold"),
@@ -162,70 +168,27 @@ RATING_MAP = {
     "sell": ("卖出", "sa-sell"),
     "bearish": ("卖出", "sa-sell"),
     "strong_sell": ("强烈卖出", "sa-strong-sell"),
-    "very_bearish": ("强烈卖出", "sa-strong-sell"),
     "strong sell": ("强烈卖出", "sa-strong-sell"),
-}
-
-# Seeking Alpha 数据库真实 sentimentId 枚举表（1=Buy, 2=Hold, 3=Sell, 4=Strong Buy, 5=Strong Sell）
-SA_SENTIMENT_ID_MAP = {
-    "1": "buy",
-    "2": "hold",
-    "3": "sell",
-    "4": "strong_buy",
-    "5": "strong_sell",
+    "very_bearish": ("强烈卖出", "sa-strong-sell"),
+    "very bearish": ("强烈卖出", "sa-strong-sell"),
 }
 
 
-def parse_sa_sentiment_attrs(attrs):
-    """准确解析 Seeking Alpha v3 sentiment 对象的评级"""
-    if not attrs:
+def normalize_rating_str(raw_rating):
+    """把 Apify 返回的 rating 字符串（如 'Strong Buy', 'Buy', 'Hold' 等）标准化"""
+    if not raw_rating:
         return None
-    for field in ["type", "rating", "label", "slug"]:
-        val = attrs.get(field)
-        if isinstance(val, str):
-            k = val.strip().lower().replace("-", "_")
-            if k in RATING_MAP:
-                return k
-            if k in SA_SENTIMENT_ID_MAP:
-                return SA_SENTIMENT_ID_MAP[k]
-    sid_num = attrs.get("sentimentId")
-    if sid_num is not None and str(sid_num) in SA_SENTIMENT_ID_MAP:
-        return SA_SENTIMENT_ID_MAP[str(sid_num)]
-    return None
-
-
-def safe_http_get(url, headers=None, params=None, timeout=6):
-    """优先使用标准 requests（绝不挂起进程），若返回 403 再在受控线程内用 curl_cffi 尝试一次"""
-    req_headers = headers or {}
-    try:
-        r = requests.get(url, headers=req_headers, params=params, timeout=(3, timeout))
-        if r.status_code == 200:
-            return r
-    except Exception:
-        pass
-
-    # 若被 403 拦截，使用线程超时包裹 curl_cffi（最多等待 5 秒，绝不卡死页面！）
-    try:
-        from curl_cffi import requests as cffi_req
-
-        def _do_cffi():
-            return cffi_req.get(
-                url, headers=req_headers, params=params,
-                impersonate="chrome110", timeout=4
-            )
-
-        with ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(_do_cffi)
-            r2 = fut.result(timeout=5)
-            if r2 is not None and r2.status_code == 200:
-                return r2
-    except (FuturesTimeout, Exception):
-        pass
+    k = str(raw_rating).strip().lower().replace("-", " ")
+    k_under = k.replace(" ", "_")
+    if k in RATING_MAP:
+        return k
+    if k_under in RATING_MAP:
+        return k_under
     return None
 
 
 def translate_titles_to_zh(titles):
-    """批量将英文标题翻译为简体中文（带严格超时，失败立即返回英文兜底）"""
+    """批量将英文标题翻译为简体中文"""
     if not titles:
         return titles
     sep = "\n ||| \n"
@@ -234,7 +197,7 @@ def translate_titles_to_zh(titles):
         r = requests.get(
             "https://translate.googleapis.com/translate_a/single",
             params={"client": "gtx", "sl": "en", "tl": "zh-CN", "dt": "t", "q": joined},
-            timeout=(3, 6),
+            timeout=(3, 8),
         )
         if r.status_code == 200:
             data = r.json()
@@ -247,122 +210,99 @@ def translate_titles_to_zh(titles):
     return titles
 
 
-@st.cache_data(ttl=1800)
-def load_seeking_alpha_feed(symbol):
-    """
-    获取 Seeking Alpha 股票纯分析文章列表及官网精确评级：
-    1. 优先请求 SA 官网 v3 symbols/{symbol}/articles 接口（修正真实 sentimentId 枚举，与官网完全对齐）
-    2. 备用通道：SA 官方股票 XML 流（仅保留 /article/ 分析文章，并发补查每篇文章的 v3 sentiments 真实评级）
-    """
-    sa_sym = symbol.lower().replace(".", "-")
-    browser_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": f"https://seekingalpha.com/symbol/{sa_sym}/analysis",
-    }
+def get_apify_token():
+    """安全读取 Streamlit Secrets 中的 APIFY_API_TOKEN"""
+    try:
+        return str(st.secrets.get("APIFY_API_TOKEN", "")).strip()
+    except Exception:
+        return ""
 
+
+@st.cache_data(ttl=21600)
+def load_seeking_alpha_feed(symbol, has_token):
+    """
+    通过 Apify 的 Seeking Alpha Stock Analysis Scraper 获取官网真实分析文章及作者评级（缓存 6 小时省额度）：
+    - 输入: tickerSymbol, analysisType="analysis", maxArticles=12
+    - 输出字段: article_title, author_name, publish_date, rating ("Strong Buy"/"Buy"/"Hold"/"Sell"/"Strong Sell")
+    """
     articles = []
+    token = get_apify_token() if has_token else ""
 
-    # 通道 1：Seeking Alpha 官网 v3 分析列表 JSON API
-    v3_url = (
-        f"https://seekingalpha.com/api/v3/symbols/{sa_sym}/articles"
-        f"?filter[category]=latest-articles"
-        f"&include=author,sentiments,sentiments.tag,primaryTickers"
-        f"&page[size]=15"
-    )
-    r = safe_http_get(v3_url, headers=browser_headers, timeout=6)
-    if r is not None:
+    # 主通道：使用 Apify Actor 同步运行并直接返回 Dataset JSON
+    if token:
+        api_url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
+        payload = {
+            "tickerSymbol": symbol,
+            "analysisType": "analysis",
+            "maxArticles": 12,
+        }
         try:
-            payload = r.json()
-            data_list = payload.get("data") or []
-            included = payload.get("included") or []
+            # Apify 云端启动真实浏览器过盾抓取通常需要 15~45 秒，首次查询后自动缓存 6 小时秒开
+            r = requests.post(
+                api_url,
+                params={"token": token},
+                json=payload,
+                timeout=(5, 75),
+            )
+            if r.status_code in (200, 201):
+                items = r.json()
+                if isinstance(items, list):
+                    for item in items:
+                        title = (
+                            item.get("article_title")
+                            or item.get("title")
+                            or ""
+                        ).strip()
+                        if not title:
+                            continue
+                        # 确保排除混入的快讯（若有 analysis_type 字段为 News 则跳过）
+                        atype = str(item.get("analysis_type") or "analysis").strip().lower()
+                        aurl = str(item.get("article_url") or item.get("url") or "")
+                        if atype == "news" or ("/news/" in aurl and "/article/" not in aurl):
+                            continue
 
-            inc_authors = {}
-            tags_by_id = {}
-            target_tag_id = None
-
-            for item in included:
-                itype = item.get("type")
-                iid = str(item.get("id"))
-                attrs = item.get("attributes") or {}
-                if itype == "author":
-                    inc_authors[iid] = (attrs.get("nick") or "Seeking Alpha Analyst").strip()
-                elif itype == "tag":
-                    slug = (attrs.get("slug") or "").upper()
-                    name = (attrs.get("name") or "").upper()
-                    tags_by_id[iid] = (slug, name)
-                    if slug in (symbol, sa_sym.upper()) or name in (symbol, sa_sym.upper()):
-                        target_tag_id = iid
-
-            sent_map = {}
-            for item in included:
-                if item.get("type") == "sentiment":
-                    sid = str(item.get("id"))
-                    rk = parse_sa_sentiment_attrs(item.get("attributes") or {})
-                    rels = item.get("relationships") or {}
-                    st_id = str((rels.get("tag", {}).get("data") or {}).get("id") or "")
-                    if rk:
-                        sent_map[sid] = (rk, st_id)
-
-            for art in data_list:
-                if art.get("type") != "article":
-                    continue
-                attrs = art.get("attributes") or {}
-                title = (attrs.get("title") or "").strip()
-                if not title:
-                    continue
-                pub = format_pub_date(attrs.get("publishOn") or "")
-
-                rels = art.get("relationships") or {}
-                author_id = str((rels.get("author", {}).get("data") or {}).get("id") or "")
-                author_name = inc_authors.get(author_id, "Seeking Alpha Analyst")
-
-                rating_key = None
-                fallback_rk = None
-                sent_refs = (rels.get("sentiments", {}).get("data"))
-                if isinstance(sent_refs, dict):
-                    sent_refs = [sent_refs]
-                if sent_refs:
-                    for s_ref in sent_refs:
-                        sid = str(s_ref.get("id") or "")
-                        if sid in sent_map:
-                            rk, st_id = sent_map[sid]
-                            slug, name = tags_by_id.get(st_id, ("", ""))
-                            if (target_tag_id and st_id == target_tag_id) or slug == symbol or name == symbol:
-                                rating_key = rk
-                                break
-                            if fallback_rk is None:
-                                fallback_rk = rk
-                    if rating_key is None:
-                        rating_key = fallback_rk
-
-                articles.append({
-                    "title_en": title,
-                    "date": pub,
-                    "author": author_name,
-                    "rating_key": rating_key,
-                })
+                        author = (
+                            item.get("author_name")
+                            or item.get("author")
+                            or "Seeking Alpha Analyst"
+                        ).strip()
+                        pub = format_pub_date(
+                            item.get("publish_date")
+                            or item.get("published_at")
+                            or item.get("date")
+                            or ""
+                        )
+                        raw_rating = (
+                            item.get("rating")
+                            or item.get("author_rating")
+                            or item.get("sentiment")
+                        )
+                        articles.append({
+                            "title_en": title,
+                            "date": pub,
+                            "author": author,
+                            "rating_key": normalize_rating_str(raw_rating),
+                        })
         except Exception:
             pass
 
-    # 通道 2：Seeking Alpha 官方 XML 流（只取 /article/ 分析类，过滤全部快讯）
+    # 备用兜底：如果还未配置 Token 或额度用尽，回退官方 XML 分析流（仅取 /article/ 分析文章，不瞎猜评级）
     if not articles:
-        xml_headers = {
-            "User-Agent": browser_headers["User-Agent"],
-            "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
-        }
         sa_xml_url = f"https://seekingalpha.com/api/sa/combined/{symbol}.xml"
-        rx = safe_http_get(sa_xml_url, headers=xml_headers, timeout=6)
-        if rx is not None and rx.content:
-            try:
+        try:
+            rx = requests.get(
+                sa_xml_url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                    )
+                },
+                timeout=(3, 8),
+            )
+            if rx.status_code == 200 and rx.content:
                 root = ET.fromstring(rx.content)
                 ns = {"sa": "https://seekingalpha.com/api/1.0"}
-                raw_items = []
                 for item in root.findall("./channel/item"):
                     orig_link = (item.findtext("link") or "").strip()
                     if "/article/" not in orig_link:
@@ -370,60 +310,19 @@ def load_seeking_alpha_feed(symbol):
                     title = (item.findtext("title") or "").strip()
                     pub = format_pub_date(item.findtext("pubDate") or "")
                     author = (item.findtext("sa:author_name", namespaces=ns) or "").strip()
-                    art_id = orig_link.split("/article/")[-1].split("-")[0].split("?")[0]
                     if title:
-                        raw_items.append({
-                            "art_id": art_id if art_id.isdigit() else "",
+                        articles.append({
                             "title_en": title,
                             "date": pub,
                             "author": author or "Seeking Alpha Analyst",
                             "rating_key": None,
                         })
-                    if len(raw_items) >= 12:
+                    if len(articles) >= 12:
                         break
+        except Exception:
+            pass
 
-                # 并发快速补查单篇文章的官网真实评级（总耗时不超过 4 秒）
-                def _fetch_one_rating(entry):
-                    aid = entry["art_id"]
-                    if not aid:
-                        return entry
-                    u = f"https://seekingalpha.com/api/v3/articles/{aid}?include=sentiments,sentiments.tag"
-                    resp = safe_http_get(u, headers=browser_headers, timeout=3)
-                    if resp is not None:
-                        try:
-                            inc = resp.json().get("included") or []
-                            tmap = {
-                                str(x.get("id")): (
-                                    (x.get("attributes", {}).get("slug") or "").upper(),
-                                    (x.get("attributes", {}).get("name") or "").upper(),
-                                )
-                                for x in inc if x.get("type") == "tag"
-                            }
-                            fb = None
-                            for x in inc:
-                                if x.get("type") == "sentiment":
-                                    rk = parse_sa_sentiment_attrs(x.get("attributes") or {})
-                                    if not rk:
-                                        continue
-                                    tid = str((x.get("relationships", {}).get("tag", {}).get("data") or {}).get("id") or "")
-                                    sl, nm = tmap.get(tid, ("", ""))
-                                    if sl in (symbol, sa_sym.upper()) or nm in (symbol, sa_sym.upper()):
-                                        entry["rating_key"] = rk
-                                        return entry
-                                    if fb is None:
-                                        fb = rk
-                            entry["rating_key"] = fb
-                        except Exception:
-                            pass
-                    return entry
-
-                if raw_items:
-                    with ThreadPoolExecutor(max_workers=4) as pool:
-                        articles = list(pool.map(_fetch_one_rating, raw_items))
-            except Exception:
-                pass
-
-    # 批量翻译中文标题 + 绑定真实官网评级徽章（若官网作者未打评级则留空，绝不乱标）
+    # 批量翻译中文标题 + 挂载官网真实评级色块
     if articles:
         zh_titles = translate_titles_to_zh([a["title_en"] for a in articles])
         for art, zh in zip(articles, zh_titles):
@@ -667,8 +566,8 @@ def load_etf_pe(symbol, years):
     if not ep_frames:
         return None, None
 
-    merged = pd.concat([f[2] for f in ep_frames], axis=1).sort_index().ffill()
-    weights = pd.Series({f[0]: f[1] for f in ep_frames})
+    merged = pd.concat([f[[2]](#__2) for f in ep_frames], axis=1).sort_index().ffill()
+    weights = pd.Series({f[0]: f[[1]](#__1) for f in ep_frames})
 
     valid_mask = merged.notna()
     weighted_ep = merged.multiply(weights, axis=1).sum(axis=1)
@@ -710,7 +609,6 @@ def load_any_pe(symbol, years):
 row1_left, row1_right = st.columns(2, gap="small")
 row2_left, row2_right = st.columns(2, gap="small")
 
-# 先把左下、右下静态预留位立即渲染出来，提升页面首屏响应感
 with row2_left:
     with st.container(border=True):
         st.markdown("**🧩 预留模块 2（左下）**")
@@ -778,10 +676,12 @@ with row1_left:
                 )
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-# 【右上角】：Seeking Alpha 股票深度分析列表（评级置于标题前 + 官网精确评级 + 中文标题 + 专属推广链接）
+# 【右上角】：Seeking Alpha 股票深度分析列表（Apify 官方抓取 + 评级前置 + 专属推广链接）
 with row1_right:
     with st.container(border=True):
         safe_ref_url = html.escape(SA_REFERRAL_URL, quote=True)
+        has_apify = bool(get_apify_token())
+
         sa_head1, sa_head2 = st.columns([2.8, 1.2])
         with sa_head1:
             st.markdown(f"**📰 Seeking Alpha 最新分析 ({ticker})**")
@@ -793,9 +693,16 @@ with row1_right:
                 unsafe_allow_html=True,
             )
 
+        if not has_apify:
+            st.caption("💡 提示：请在 Streamlit Secrets 中填入 `APIFY_API_TOKEN` 以显示官网精确作者评级。")
+
         if ticker:
-            with st.spinner("正在同步 Seeking Alpha 分析与评级..."):
-                sa_articles = load_seeking_alpha_feed(ticker)
+            spinner_msg = (
+                f"正在从 Seeking Alpha 实时提取 {ticker} 分析与评级（首次约需 15~30 秒，之后秒开）..."
+                if has_apify else "正在拉取 Seeking Alpha 分析列表..."
+            )
+            with st.spinner(spinner_msg):
+                sa_articles = load_seeking_alpha_feed(ticker, has_apify)
 
             if not sa_articles:
                 st.markdown(f"""
