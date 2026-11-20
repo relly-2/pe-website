@@ -133,7 +133,7 @@ with head_col2:
     ).upper().strip()
 with head_col3:
     years = st.selectbox(
-        "时间范围", [1, 3, 5, 10], index=3,
+        "时间范围", [1, 3, 5, 10, 20], index=4,
         format_func=lambda x: f"过去 {x} 年",
         label_visibility="collapsed"
     )
@@ -1135,7 +1135,7 @@ with row1_left:
                 ))
                 fig.add_hline(y=median, line_dash="dash", annotation_text=f"中位 {median:.1f}")
                 fig.update_layout(
-                    height=195,
+                    height=340,
                     margin=dict(l=5, r=5, t=8, b=5),
                     yaxis_title="PE",
                     xaxis_title=None,
