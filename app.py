@@ -1034,13 +1034,19 @@ def load_etf_pe(symbol, years):
 
     merged = pd.concat([frame for _, _, frame in ep_frames], axis=1).sort_index().ffill()
     weights = pd.Series({sym: w for sym, w, _ in ep_frames})
+    total_weight = float(weights.sum())
 
     valid_mask = merged.notna()
     weighted_ep = merged.multiply(weights, axis=1).sum(axis=1)
     active_weight = valid_mask.multiply(weights, axis=1).sum(axis=1)
 
-    basket_ep = (weighted_ep / active_weight).where(active_weight > 0)
+    # 只有当有数据的成分股权重占比 >= 60% 时才计算，避免早年只剩两三只股票时失真
+    coverage = active_weight / total_weight
+    basket_ep = (weighted_ep / active_weight).where(coverage >= 0.6)
     basket_pe = (1.0 / basket_ep).where(basket_ep > 0)
+    # 盈利率接近 0 会产生极端值，超过 150 的点不显示
+    basket_pe = basket_pe.where(basket_pe <= 150)
+
 
     res_df = pd.DataFrame({"date": basket_pe.index, "pe": basket_pe.values}).dropna()
     if res_df.empty:
